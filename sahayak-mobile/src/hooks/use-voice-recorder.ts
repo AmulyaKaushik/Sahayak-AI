@@ -24,9 +24,31 @@ const RECORDING_OPTIONS: RecordingOptions = {
 
 // How often (ms) the recorder reports duration and level while recording.
 const STATUS_INTERVAL_MS = 100;
-// Metering is in dBFS: 0 is the loudest possible, -160 is silence. A quiet
-// room sits around -50 to -60; speech near the phone peaks around -25 to -10.
-const SILENCE_THRESHOLD_DB = -40;
+// Metering is in dBFS: 0 is the loudest possible, -160 is silence.
+// Silence detection: ignore the first/last EDGE_IGNORE_MS (the tap on the
+// button makes a loud click right at the start and end), then call the clip
+// speech only if at least MIN_LOUD_SAMPLES readings (~300 ms) are louder than
+// LOUD_DB. A single spike is not enough. Tune with the [recorder] log line.
+const EDGE_IGNORE_MS = 300;
+const LOUD_DB = -30;
+const MIN_LOUD_SAMPLES = 3;
+
+type LevelSample = { t: number; db: number };
+
+function analyseLevels(samples: LevelSample[]) {
+  const end = samples.length ? samples[samples.length - 1].t : 0;
+  const middle = samples.filter((s) => s.t >= EDGE_IGNORE_MS && s.t <= end - EDGE_IGNORE_MS);
+  const sorted = middle.map((s) => s.db).sort((a, b) => a - b);
+  const loud = sorted.filter((db) => db > LOUD_DB).length;
+  return {
+    // No readings (metering unsupported, or a very short clip): don't block it.
+    isSilent: sorted.length > 0 && loud < MIN_LOUD_SAMPLES,
+    peak: sorted.length ? sorted[sorted.length - 1] : -160,
+    median: sorted.length ? sorted[Math.floor(sorted.length / 2)] : -160,
+    loud,
+    total: sorted.length,
+  };
+}
 
 // 'undetermined' = never asked; 'blocked' = denied and the OS won't show the
 // prompt again, so the only way forward is the phone's Settings app.
@@ -34,7 +56,7 @@ export type MicPermission = 'undetermined' | 'granted' | 'denied' | 'blocked';
 
 export type FinishedRecording = {
   uri: string;
-  // True when the clip never got louder than SILENCE_THRESHOLD_DB.
+  // True when the clip had no sustained loud section (see analyseLevels).
   isSilent: boolean;
 };
 
@@ -47,16 +69,16 @@ export function useVoiceRecorder() {
   const [permission, setPermission] = useState<MicPermission>('undetermined');
   const [recordingUri, setRecordingUri] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Loudest level seen during the current recording. A ref (not state)
-  // because updating it should not redraw the screen.
-  const peakDb = useRef(-160);
+  // Level readings for the current recording. A ref (not state) because
+  // adding to it should not redraw the screen.
+  const levels = useRef<LevelSample[]>([]);
 
   useEffect(() => {
-    const level = recorderState.metering;
-    if (recorderState.isRecording && level !== undefined && level > peakDb.current) {
-      peakDb.current = level;
+    const db = recorderState.metering;
+    if (recorderState.isRecording && db !== undefined) {
+      levels.current.push({ t: recorderState.durationMillis, db });
     }
-  }, [recorderState.isRecording, recorderState.metering]);
+  }, [recorderState.isRecording, recorderState.metering, recorderState.durationMillis]);
 
   // Check (without prompting) whether permission was already granted.
   useEffect(() => {
@@ -85,7 +107,7 @@ export function useVoiceRecorder() {
       // iOS: the audio session must be switched into recording mode first.
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
       await recorder.prepareToRecordAsync();
-      peakDb.current = -160;
+      levels.current = [];
       recorder.record();
       return true;
     } catch (e) {
@@ -104,9 +126,15 @@ export function useVoiceRecorder() {
       if (!uri) throw new Error('recording produced no file');
       setRecordingUri(uri);
       player.replace({ uri });
-      // Shows in the `npx expo start` terminal; use it to tune the threshold.
-      if (__DEV__) console.log(`[recorder] peak level ${peakDb.current.toFixed(1)} dB`);
-      return { uri, isSilent: peakDb.current < SILENCE_THRESHOLD_DB };
+      const a = analyseLevels(levels.current);
+      // Shows in the `npx expo start` terminal; use it to tune LOUD_DB.
+      if (__DEV__) {
+        console.log(
+          `[recorder] peak ${a.peak.toFixed(1)} dB, median ${a.median.toFixed(1)} dB, ` +
+            `loud ${a.loud}/${a.total} → ${a.isSilent ? 'SILENT' : 'speech'}`,
+        );
+      }
+      return { uri, isSilent: a.isSilent };
     } catch (e) {
       setError(`Could not stop recording: ${String(e)}`);
       return null;

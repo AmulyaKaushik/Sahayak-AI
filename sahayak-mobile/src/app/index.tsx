@@ -1,17 +1,25 @@
-import { Link } from 'expo-router';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import { useRef } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { MessageBubble, TypingIndicator } from '@/components/message-bubble';
+import { MicButton, MicState } from '@/components/mic-button';
+import { NoticeCard } from '@/components/notice-card';
+import { OfflineBanner } from '@/components/offline-banner';
+import { colors } from '@/constants/colors';
 import { env } from '@/config/env';
 import { useVoiceRecorder } from '@/hooks/use-voice-recorder';
-import { ChatMessage, useConversation } from '@/store/conversation';
+import { useConversation } from '@/store/conversation';
 
 function formatDuration(ms: number) {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// Home screen (route "/"). Phase D: speak → transcript → (mock) backend reply.
+const EXAMPLES = ['"I want to apply for a home loan"', '"मुझे बचत खाता खोलना है"'];
+
+// Home screen (route "/"): the voice conversation.
 export default function HomeScreen() {
   const voice = useVoiceRecorder();
   const messages = useConversation((s) => s.messages);
@@ -20,11 +28,17 @@ export default function HomeScreen() {
   const canRetry = useConversation((s) => s.pending !== null);
   const speakingId = useConversation((s) => s.speakingId);
   const ttsNotice = useConversation((s) => s.ttsNotice);
-  const { processRecording, retry, clearError, speakMessage, stopSpeaking } =
+  const { processRecording, retry, clearError, speakMessage, stopSpeaking, dismissTtsNotice } =
     useConversation.getState();
   const scrollRef = useRef<ScrollView>(null);
+  const insets = useSafeAreaInsets();
 
-  const busy = status === 'transcribing' || status === 'sending';
+  const micState: MicState = voice.isRecording
+    ? 'recording'
+    : status === 'error' || voice.error
+      ? 'error'
+      : status;
+  const busy = micState === 'transcribing' || micState === 'sending' || micState === 'waiting';
 
   async function onMicPress() {
     if (voice.isRecording) {
@@ -38,20 +52,19 @@ export default function HomeScreen() {
     }
   }
 
-  const statusText = voice.isRecording
-    ? `Listening… ${formatDuration(voice.durationMillis)}`
-    : status === 'transcribing'
-      ? 'Transcribing…'
-      : status === 'sending'
-        ? 'Thinking…'
-        : status === 'speaking'
-          ? 'Speaking… (tap the mic to interrupt)'
-          : voice.isPlaying
-            ? 'Playing your recording…'
-            : 'Tap the mic and speak';
+  const statusText: Record<MicState, string> = {
+    idle: 'Tap the mic and speak',
+    recording: `Listening… ${formatDuration(voice.durationMillis)} · tap to stop`,
+    transcribing: 'Understanding what you said…',
+    sending: 'Sending…',
+    waiting: 'Sahayak is thinking…',
+    speaking: 'Speaking… tap the mic to interrupt',
+    error: 'Tap the mic to try again',
+  };
 
   return (
     <View style={styles.container}>
+      <OfflineBanner />
       {(env.useMockStt || env.useMockApi) && (
         <Text style={styles.mockBadge}>
           MOCK: {[env.useMockStt && 'speech-to-text', env.useMockApi && 'backend']
@@ -67,10 +80,21 @@ export default function HomeScreen() {
         // Keep the newest message in view.
         onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}>
         {messages.length === 0 && (
-          <Text style={styles.empty}>Ask about loans, accounts or schemes in Hindi or English.</Text>
+          <View style={styles.empty}>
+            <Ionicons name="chatbubbles-outline" size={48} color={colors.textFaint} />
+            <Text style={styles.emptyTitle}>Namaste! How can I help?</Text>
+            <Text style={styles.emptyText}>
+              Ask about loans, accounts or government schemes in Hindi or English. Try:
+            </Text>
+            {EXAMPLES.map((e) => (
+              <Text key={e} style={styles.example}>
+                {e}
+              </Text>
+            ))}
+          </View>
         )}
         {messages.map((m) => (
-          <MessageRow
+          <MessageBubble
             key={m.id}
             message={m}
             isSpeaking={m.id === speakingId}
@@ -81,169 +105,87 @@ export default function HomeScreen() {
             }
           />
         ))}
+        {(status === 'sending' || status === 'waiting') && <TypingIndicator />}
       </ScrollView>
 
-      <View style={styles.controls}>
-        <Text style={styles.status}>{statusText}</Text>
-
+      <View style={[styles.controls, { paddingBottom: Math.max(insets.bottom, 16) }]}>
         {error && (
-          <View style={styles.errorRow}>
-            <Text style={styles.error}>{error}</Text>
-            {canRetry && (
-              <Pressable onPress={retry} style={styles.smallButton}>
-                <Text style={styles.smallButtonText}>Retry</Text>
-              </Pressable>
-            )}
-          </View>
+          <NoticeCard
+            tone="danger"
+            message={error}
+            actions={[
+              ...(canRetry ? [{ label: 'Retry', onPress: retry }] : []),
+              { label: 'Dismiss', onPress: clearError },
+            ]}
+          />
         )}
-
-        <Pressable
-          onPress={onMicPress}
-          disabled={busy}
-          style={({ pressed }) => [
-            styles.mic,
-            voice.isRecording && styles.micRecording,
-            (pressed || busy) && styles.micDimmed,
-          ]}
-          accessibilityRole="button"
-          accessibilityLabel={voice.isRecording ? 'Stop recording' : 'Start recording'}>
-          {busy ? (
-            <ActivityIndicator color="#fff" size="large" />
-          ) : (
-            <Text style={styles.micText}>{voice.isRecording ? 'Stop' : 'Mic'}</Text>
-          )}
-        </Pressable>
-
+        {voice.error && <NoticeCard tone="danger" message={voice.error} />}
+        {ttsNotice && (
+          <NoticeCard
+            tone="warning"
+            message={ttsNotice}
+            actions={[{ label: 'OK', onPress: dismissTtsNotice }]}
+          />
+        )}
         {voice.permission === 'denied' && (
-          <Text style={styles.warning}>
-            Microphone access is needed to talk to Sahayak. Tap the mic to be asked again.
-          </Text>
+          <NoticeCard
+            tone="warning"
+            message="Microphone access is needed to talk to Sahayak. Tap the mic to be asked again."
+          />
         )}
         {voice.permission === 'blocked' && (
-          <View style={styles.center}>
-            <Text style={styles.warning}>
-              Microphone access is turned off for this app. Enable it in your phone&apos;s
-              settings.
-            </Text>
-            <Pressable onPress={voice.openSettings} style={styles.smallButton}>
-              <Text style={styles.smallButtonText}>Open phone settings</Text>
-            </Pressable>
-          </View>
+          <NoticeCard
+            tone="warning"
+            message="Microphone access is turned off for this app."
+            actions={[{ label: 'Open phone settings', onPress: voice.openSettings }]}
+          />
         )}
-        {voice.error && <Text style={styles.error}>{voice.error}</Text>}
-        {ttsNotice && <Text style={styles.warning}>{ttsNotice}</Text>}
 
-        <View style={styles.footer}>
-          {voice.recordingUri && !voice.isRecording && (
-            <Pressable onPress={voice.playRecording}>
-              <Text style={styles.link}>Play my recording</Text>
-            </Pressable>
-          )}
-          <Link href="/settings" style={styles.link}>
-            Settings
-          </Link>
-        </View>
+        <Text style={styles.status} accessibilityLiveRegion="polite">
+          {statusText[micState]}
+        </Text>
+        <MicButton state={micState} onPress={onMicPress} disabled={busy} />
+
+        {voice.recordingUri && !voice.isRecording && (
+          <Pressable onPress={voice.playRecording} hitSlop={8}>
+            <Text style={styles.link}>
+              {voice.isPlaying ? 'Playing your recording…' : 'Play my last recording'}
+            </Text>
+          </Pressable>
+        )}
       </View>
     </View>
   );
 }
 
-function MessageRow({
-  message,
-  isSpeaking,
-  onPress,
-}: {
-  message: ChatMessage;
-  isSpeaking: boolean;
-  onPress?: () => void;
-}) {
-  const isUser = message.role === 'user';
-  const meta = message.meta;
-  const details = [
-    meta?.eligible !== undefined && `eligible: ${meta.eligible ? 'yes' : 'no'}`,
-    meta?.missing_fields?.length && `needs: ${meta.missing_fields.join(', ')}`,
-    isSpeaking ? 'speaking…' : onPress && 'tap to hear again',
-  ].filter(Boolean);
-
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={!onPress}
-      style={[
-        styles.bubble,
-        isUser ? styles.userBubble : styles.assistantBubble,
-        isSpeaking && styles.speakingBubble,
-      ]}>
-      <Text style={isUser ? styles.userText : styles.assistantText}>{message.text}</Text>
-      <Text style={[styles.meta, isUser && styles.userMeta]}>
-        {message.language}
-        {details.length > 0 && ` · ${details.join(' · ')}`}
-      </Text>
-    </Pressable>
-  );
-}
-
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff' },
-  center: { alignItems: 'center' },
+  container: { flex: 1, backgroundColor: colors.background },
   mockBadge: {
     alignSelf: 'center',
     marginTop: 8,
     fontSize: 12,
     fontWeight: '700',
-    color: '#B45309',
-    backgroundColor: '#FEF3C7',
+    color: colors.warning,
+    backgroundColor: colors.warningSoft,
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 4,
+    overflow: 'hidden',
   },
   messages: { flex: 1 },
-  messagesContent: { padding: 16, gap: 10 },
-  empty: { color: '#94A3B8', textAlign: 'center', marginTop: 48, fontSize: 16 },
-  bubble: { maxWidth: '85%', padding: 12, borderRadius: 16 },
-  userBubble: { alignSelf: 'flex-end', backgroundColor: '#208AEF', borderBottomRightRadius: 4 },
-  assistantBubble: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#F1F5F9',
-    borderBottomLeftRadius: 4,
-  },
-  speakingBubble: { borderWidth: 2, borderColor: '#208AEF' },
-  userText: { color: '#fff', fontSize: 17 },
-  assistantText: { color: '#0F172A', fontSize: 17 },
-  meta: { marginTop: 4, fontSize: 11, color: '#64748B' },
-  userMeta: { color: '#DBEAFE' },
+  messagesContent: { padding: 16, gap: 10, flexGrow: 1 },
+  empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, padding: 24 },
+  emptyTitle: { fontSize: 20, fontWeight: '700', color: colors.text, marginTop: 8 },
+  emptyText: { fontSize: 15, color: colors.textMuted, textAlign: 'center', lineHeight: 22 },
+  example: { fontSize: 15, color: colors.primary, fontStyle: 'italic' },
   controls: {
     alignItems: 'center',
-    paddingHorizontal: 24,
-    paddingTop: 12,
-    paddingBottom: 24,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: '#E2E8F0',
-  },
-  status: { fontSize: 16, color: '#333', marginBottom: 12 },
-  mic: {
-    width: 96,
-    height: 96,
-    borderRadius: 48,
-    backgroundColor: '#208AEF',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  micRecording: { backgroundColor: '#E5484D' },
-  micDimmed: { opacity: 0.7 },
-  micText: { color: '#fff', fontSize: 18, fontWeight: '700' },
-  errorRow: { alignItems: 'center', marginBottom: 12 },
-  smallButton: {
-    marginTop: 8,
-    paddingVertical: 6,
     paddingHorizontal: 16,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#208AEF',
+    paddingTop: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+    backgroundColor: colors.background,
   },
-  smallButtonText: { color: '#208AEF', fontSize: 15, fontWeight: '600' },
-  warning: { marginTop: 12, color: '#B45309', textAlign: 'center' },
-  error: { color: '#E5484D', textAlign: 'center' },
-  footer: { flexDirection: 'row', gap: 24, marginTop: 16 },
-  link: { color: '#208AEF', fontSize: 15 },
+  status: { fontSize: 15, color: colors.textMuted },
+  link: { color: colors.primary, fontSize: 14, marginTop: 4 },
 });

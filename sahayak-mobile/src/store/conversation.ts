@@ -4,6 +4,8 @@ import type { FinishedRecording } from '@/hooks/use-voice-recorder';
 import { createSession, sendMessage, SendMessageResponse } from '@/services/api';
 import { transcribe } from '@/services/stt';
 import * as tts from '@/services/tts';
+import { useConnectivity } from '@/store/connectivity';
+import { useSettings } from '@/store/settings';
 
 // Global conversation state (Zustand). Any component can read it with
 // useConversation((s) => s.someField) and re-renders only when that field
@@ -15,13 +17,24 @@ export type ChatMessage = {
   role: 'user' | 'assistant';
   text: string;
   language: string;
+  createdAt: number; // ms since epoch
   // Extra backend fields on assistant replies (eligible, missing_fields, ...).
   meta?: Omit<SendMessageResponse, 'reply_text' | 'language'>;
 };
 
 // Pipeline stage after the recording has stopped. (Recording itself is
-// tracked by the useVoiceRecorder hook.)
-export type PipelineStatus = 'idle' | 'transcribing' | 'sending' | 'speaking' | 'error';
+// tracked by the useVoiceRecorder hook.) 'sending' covers opening the session
+// and posting the message; if no reply has arrived after WAITING_AFTER_MS it
+// becomes 'waiting' so the UI can say the backend is still working.
+export type PipelineStatus =
+  | 'idle'
+  | 'transcribing'
+  | 'sending'
+  | 'waiting'
+  | 'speaking'
+  | 'error';
+
+const WAITING_AFTER_MS = 800;
 
 // What to redo when the user taps Retry.
 type PendingStep =
@@ -44,6 +57,7 @@ type ConversationState = {
   clearError: () => void;
   speakMessage: (id: string) => Promise<void>;
   stopSpeaking: () => Promise<void>;
+  dismissTtsNotice: () => void;
   resetConversation: () => void;
 };
 
@@ -72,9 +86,10 @@ export const useConversation = create<ConversationState>()((set, get) => {
 
   async function runTranscribe(uri: string) {
     set({ status: 'transcribing', error: null, pending: null });
+    const { spokenLanguage } = useSettings.getState();
     let transcript;
     try {
-      transcript = await transcribe(uri);
+      transcript = await transcribe(uri, spokenLanguage === 'auto' ? undefined : spokenLanguage);
     } catch (e) {
       return fail(e, { step: 'transcribe', uri });
     }
@@ -84,7 +99,13 @@ export const useConversation = create<ConversationState>()((set, get) => {
     set((s) => ({
       messages: [
         ...s.messages,
-        { id: newId(), role: 'user', text: transcript.text, language: transcript.language },
+        {
+          id: newId(),
+          role: 'user',
+          text: transcript.text,
+          language: transcript.language,
+          createdAt: Date.now(),
+        },
       ],
     }));
     await runSend(transcript.text, transcript.language);
@@ -92,6 +113,9 @@ export const useConversation = create<ConversationState>()((set, get) => {
 
   async function runSend(text: string, language: string) {
     set({ status: 'sending', error: null, pending: null });
+    const waitingTimer = setTimeout(() => {
+      if (get().status === 'sending') set({ status: 'waiting' });
+    }, WAITING_AFTER_MS);
     let reply: ChatMessage;
     try {
       // Sessions are created lazily on the first message and then reused.
@@ -104,9 +128,20 @@ export const useConversation = create<ConversationState>()((set, get) => {
         text,
         language,
       });
-      reply = { id: newId(), role: 'assistant', text: reply_text, language: replyLanguage, meta };
+      reply = {
+        id: newId(),
+        role: 'assistant',
+        text: reply_text,
+        language: replyLanguage,
+        createdAt: Date.now(),
+        meta,
+      };
     } catch (e) {
+      // Let the offline banner find out whether the backend itself is down.
+      useConnectivity.getState().checkBackend();
       return fail(e, { step: 'send', text, language });
+    } finally {
+      clearTimeout(waitingTimer);
     }
     set((s) => ({ messages: [...s.messages, reply] }));
     await speakReply(reply);
@@ -169,6 +204,8 @@ export const useConversation = create<ConversationState>()((set, get) => {
       set({ speakingId: null, ...(get().status === 'speaking' && { status: 'idle' }) });
       await tts.stopSpeaking();
     },
+
+    dismissTtsNotice: () => set({ ttsNotice: null }),
 
     resetConversation: () => {
       speechToken++;
