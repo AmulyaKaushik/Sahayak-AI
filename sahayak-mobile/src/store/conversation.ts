@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import type { FinishedRecording } from '@/hooks/use-voice-recorder';
 import { createSession, sendMessage, SendMessageResponse } from '@/services/api';
 import { transcribe } from '@/services/stt';
+import * as tts from '@/services/tts';
 
 // Global conversation state (Zustand). Any component can read it with
 // useConversation((s) => s.someField) and re-renders only when that field
@@ -19,8 +20,8 @@ export type ChatMessage = {
 };
 
 // Pipeline stage after the recording has stopped. (Recording itself is
-// tracked by the useVoiceRecorder hook.) 'speaking' is added in Phase E.
-export type PipelineStatus = 'idle' | 'transcribing' | 'sending' | 'error';
+// tracked by the useVoiceRecorder hook.)
+export type PipelineStatus = 'idle' | 'transcribing' | 'sending' | 'speaking' | 'error';
 
 // What to redo when the user taps Retry.
 type PendingStep =
@@ -33,15 +34,32 @@ type ConversationState = {
   status: PipelineStatus;
   error: string | null;
   pending: PendingStep | null;
+  // Which assistant message is being read aloud, if any.
+  speakingId: string | null;
+  // Non-blocking TTS problem, e.g. no Hindi voice installed.
+  ttsNotice: string | null;
 
   processRecording: (recording: FinishedRecording) => Promise<void>;
   retry: () => Promise<void>;
   clearError: () => void;
+  speakMessage: (id: string) => Promise<void>;
+  stopSpeaking: () => Promise<void>;
   resetConversation: () => void;
 };
 
+const LANGUAGE_NAMES: Record<string, string> = {
+  hi: 'Hindi', en: 'English', bn: 'Bengali', mr: 'Marathi', ta: 'Tamil', te: 'Telugu',
+  gu: 'Gujarati', kn: 'Kannada', ml: 'Malayalam', pa: 'Punjabi', ur: 'Urdu',
+};
+
+// Whisper sometimes returns only punctuation (".") for noise.
+const hasWords = (text: string) => text.replace(/[\s.,!?;:'"()…।॥-]/g, '').length > 0;
+
 let nextId = 0;
 const newId = () => `${Date.now()}-${nextId++}`;
+// Incremented on every speak/stop so a late callback from an older utterance
+// can't flip the status of a newer one.
+let speechToken = 0;
 
 export const useConversation = create<ConversationState>()((set, get) => {
   function fail(error: unknown, pending: PendingStep | null) {
@@ -60,7 +78,7 @@ export const useConversation = create<ConversationState>()((set, get) => {
     } catch (e) {
       return fail(e, { step: 'transcribe', uri });
     }
-    if (!transcript.text) {
+    if (!hasWords(transcript.text)) {
       return fail(new Error("I couldn't make out any words. Please try again."), null);
     }
     set((s) => ({
@@ -74,6 +92,7 @@ export const useConversation = create<ConversationState>()((set, get) => {
 
   async function runSend(text: string, language: string) {
     set({ status: 'sending', error: null, pending: null });
+    let reply: ChatMessage;
     try {
       // Sessions are created lazily on the first message and then reused.
       let sessionId = get().sessionId;
@@ -85,16 +104,33 @@ export const useConversation = create<ConversationState>()((set, get) => {
         text,
         language,
       });
-      set((s) => ({
-        status: 'idle',
-        messages: [
-          ...s.messages,
-          { id: newId(), role: 'assistant', text: reply_text, language: replyLanguage, meta },
-        ],
-      }));
+      reply = { id: newId(), role: 'assistant', text: reply_text, language: replyLanguage, meta };
     } catch (e) {
-      fail(e, { step: 'send', text, language });
+      return fail(e, { step: 'send', text, language });
     }
+    set((s) => ({ messages: [...s.messages, reply] }));
+    await speakReply(reply);
+  }
+
+  async function speakReply(message: ChatMessage) {
+    const token = ++speechToken;
+    set({ status: 'speaking', speakingId: message.id, ttsNotice: null });
+
+    if ((await tts.hasVoiceFor(message.language)) === false) {
+      const name = LANGUAGE_NAMES[message.language.split('-')[0]] ?? message.language;
+      set({
+        ttsNotice: `No ${name} voice is installed on this phone, so replies may sound wrong. Add one in the phone's text-to-speech / Spoken Content settings.`,
+      });
+    }
+
+    await tts.speak(message.text, message.language, (error) => {
+      if (token !== speechToken) return; // a newer utterance took over
+      set({
+        status: 'idle',
+        speakingId: null,
+        ...(error && { ttsNotice: `Could not read the reply aloud: ${error.message}` }),
+      });
+    });
   }
 
   return {
@@ -103,6 +139,8 @@ export const useConversation = create<ConversationState>()((set, get) => {
     status: 'idle',
     error: null,
     pending: null,
+    speakingId: null,
+    ttsNotice: null,
 
     async processRecording({ uri, isSilent }) {
       if (isSilent) {
@@ -121,7 +159,29 @@ export const useConversation = create<ConversationState>()((set, get) => {
 
     clearError: () => set({ status: 'idle', error: null, pending: null }),
 
-    resetConversation: () =>
-      set({ messages: [], sessionId: null, status: 'idle', error: null, pending: null }),
+    async speakMessage(id) {
+      const message = get().messages.find((m) => m.id === id);
+      if (message) await speakReply(message);
+    },
+
+    async stopSpeaking() {
+      speechToken++;
+      set({ speakingId: null, ...(get().status === 'speaking' && { status: 'idle' }) });
+      await tts.stopSpeaking();
+    },
+
+    resetConversation: () => {
+      speechToken++;
+      tts.stopSpeaking();
+      set({
+        messages: [],
+        sessionId: null,
+        status: 'idle',
+        error: null,
+        pending: null,
+        speakingId: null,
+        ttsNotice: null,
+      });
+    },
   };
 });

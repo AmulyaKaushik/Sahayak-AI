@@ -18,7 +18,10 @@ export default function HomeScreen() {
   const status = useConversation((s) => s.status);
   const error = useConversation((s) => s.error);
   const canRetry = useConversation((s) => s.pending !== null);
-  const { processRecording, retry, clearError } = useConversation.getState();
+  const speakingId = useConversation((s) => s.speakingId);
+  const ttsNotice = useConversation((s) => s.ttsNotice);
+  const { processRecording, retry, clearError, speakMessage, stopSpeaking } =
+    useConversation.getState();
   const scrollRef = useRef<ScrollView>(null);
 
   const busy = status === 'transcribing' || status === 'sending';
@@ -28,6 +31,8 @@ export default function HomeScreen() {
       const recording = await voice.stopRecording();
       if (recording) await processRecording(recording);
     } else {
+      // Tapping the mic while a reply is being read aloud interrupts it.
+      await stopSpeaking();
       clearError();
       await voice.startRecording();
     }
@@ -39,9 +44,11 @@ export default function HomeScreen() {
       ? 'Transcribing…'
       : status === 'sending'
         ? 'Thinking…'
-        : voice.isPlaying
-          ? 'Playing your recording…'
-          : 'Tap the mic and speak';
+        : status === 'speaking'
+          ? 'Speaking… (tap the mic to interrupt)'
+          : voice.isPlaying
+            ? 'Playing your recording…'
+            : 'Tap the mic and speak';
 
   return (
     <View style={styles.container}>
@@ -63,7 +70,16 @@ export default function HomeScreen() {
           <Text style={styles.empty}>Ask about loans, accounts or schemes in Hindi or English.</Text>
         )}
         {messages.map((m) => (
-          <MessageRow key={m.id} message={m} />
+          <MessageRow
+            key={m.id}
+            message={m}
+            isSpeaking={m.id === speakingId}
+            onPress={
+              m.role === 'assistant' && !busy && !voice.isRecording
+                ? () => speakMessage(m.id)
+                : undefined
+            }
+          />
         ))}
       </ScrollView>
 
@@ -115,6 +131,7 @@ export default function HomeScreen() {
           </View>
         )}
         {voice.error && <Text style={styles.error}>{voice.error}</Text>}
+        {ttsNotice && <Text style={styles.warning}>{ttsNotice}</Text>}
 
         <View style={styles.footer}>
           {voice.recordingUri && !voice.isRecording && (
@@ -131,22 +148,38 @@ export default function HomeScreen() {
   );
 }
 
-function MessageRow({ message }: { message: ChatMessage }) {
+function MessageRow({
+  message,
+  isSpeaking,
+  onPress,
+}: {
+  message: ChatMessage;
+  isSpeaking: boolean;
+  onPress?: () => void;
+}) {
   const isUser = message.role === 'user';
   const meta = message.meta;
   const details = [
     meta?.eligible !== undefined && `eligible: ${meta.eligible ? 'yes' : 'no'}`,
     meta?.missing_fields?.length && `needs: ${meta.missing_fields.join(', ')}`,
+    isSpeaking ? 'speaking…' : onPress && 'tap to hear again',
   ].filter(Boolean);
 
   return (
-    <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress}
+      style={[
+        styles.bubble,
+        isUser ? styles.userBubble : styles.assistantBubble,
+        isSpeaking && styles.speakingBubble,
+      ]}>
       <Text style={isUser ? styles.userText : styles.assistantText}>{message.text}</Text>
       <Text style={[styles.meta, isUser && styles.userMeta]}>
         {message.language}
         {details.length > 0 && ` · ${details.join(' · ')}`}
       </Text>
-    </View>
+    </Pressable>
   );
 }
 
@@ -174,6 +207,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#F1F5F9',
     borderBottomLeftRadius: 4,
   },
+  speakingBubble: { borderWidth: 2, borderColor: '#208AEF' },
   userText: { color: '#fff', fontSize: 17 },
   assistantText: { color: '#0F172A', fontSize: 17 },
   meta: { marginTop: 4, fontSize: 11, color: '#64748B' },
