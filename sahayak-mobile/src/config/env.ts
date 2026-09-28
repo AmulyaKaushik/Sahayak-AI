@@ -12,4 +12,7 @@
 export const env = {
   useMockStt: process.env.EXPO_PUBLIC_USE_MOCK_STT !== 'false',
   groqApiKey: process.env.EXPO_PUBLIC_GROQ_API_KEY ?? '',
+  // Both default to the mock so the app works with no .env.local at all.
+  useMockApi: process.env.EXPO_PUBLIC_USE_MOCK_API !== 'false',
+  apiBaseUrl: process.env.EXPO_PUBLIC_API_BASE_URL ?? '',
 };

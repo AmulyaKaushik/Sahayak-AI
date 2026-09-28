@@ -62,15 +62,27 @@ async function transcribeGroq(audioUri: string): Promise<Transcript> {
   form.append('response_format', 'verbose_json');
 
   try {
-    const { data } = await axios.post<{ text: string; language?: string }>(GROQ_URL, form, {
+    const { data } = await axios.post<GroqResponse>(GROQ_URL, form, {
       headers: { Authorization: `Bearer ${env.groqApiKey}` },
       timeout: TIMEOUT_MS,
     });
-    const text = data.text.trim();
+    // Whisper invents text ("Hello!", "Thank you.") for silence. Drop
+    // segments it itself flags as probably-not-speech.
+    const text = data.segments
+      ? data.segments.filter((s) => !isLikelySilence(s)).map((s) => s.text).join('').trim()
+      : data.text.trim();
     return { text, language: resolveLanguage(data.language, text) };
   } catch (e) {
     throw new Error(describeError(e));
   }
+}
+
+type GroqSegment = { text: string; no_speech_prob: number; avg_logprob: number };
+type GroqResponse = { text: string; language?: string; segments?: GroqSegment[] };
+
+// The same rule Whisper's reference implementation uses to skip silence.
+function isLikelySilence(s: GroqSegment): boolean {
+  return s.no_speech_prob > 0.6 && s.avg_logprob < -1;
 }
 
 function resolveLanguage(detected: string | undefined, text: string): string {
