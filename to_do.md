@@ -1,5 +1,11 @@
 # DEMO DEPLOY (Render + Supabase + Upstash) - do this section first
 
+**Status 2026-11-16: the backend is deployed on Render and verified over HTTPS** (register, login, refresh, chat,
+documents, Hindi, profile, PIN refusal, session isolation, debug/admin routes locked). Replies take 6-11 s there.
+**Still open, in order:** (1) connect the mobile app (section 7 below), (2) add a database connection pool to cut
+latency, (3) H1 Hindi verdict check, (4) check `GET /api/v1/admin/documents` shows all 10 PDFs `active` and test
+speech-to-text with real audio on Render, (5) keep the free service awake before the demo.
+
 Scope: call demo only, not for many users. Skip section 9 and the abuse/limit items (M1, M2, M3, M4).
 
 **Done in code:** `AUTO_SETUP=true` runs migrations, seeds missing eligibility rules and syncs `backend/documents/` on every start. The Dockerfile uses Render's `$PORT`.

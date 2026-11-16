@@ -1,3 +1,7 @@
+> **Historical document.** This is the original kiosk-era design. It is kept for reference and no longer
+> matches the code. The current, as-built architecture, status and roadmap are in
+> `docs/banking_voice_agent_architecture.md`.
+
 # Sahayak AI — Final Architecture & Phase-by-Phase Execution Plan
 
 Multilingual, voice-first banking assistant for rural financial inclusion. Deployed as a branch/kiosk system — the customer never needs their own internet or device; only the kiosk needs connectivity, and even that is designed to degrade gracefully.

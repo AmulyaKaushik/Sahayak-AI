@@ -1,11 +1,26 @@
 # Sahayak AI Backend — Working Guide
 
-Status: Phases 0-4 are built and tested, plus a session-aware `/api/v1/query`
-pipeline (sentence in -> unconditional fact extraction -> turn classification
--> worker(s) -> structured answer out) covering 9 hand-encoded schemes/loans.
-RAG, document ingestion, the rest of the mobile-facing `/api/v1/...`
-contract, offline resilience, security hardening, and final test/demo prep
-are not yet built.
+Status (2026-11-16): the backend is built, tested (126 tests) and deployed for a
+demo on Render. It has JWT auth, server-owned sessions, the Sahayak_AI
+router/orchestrator/refiner, the eligibility agent, the RAG agent with PDF
+ingestion, a speech-to-text proxy, Groq key rotation and an LLM-free fallback
+for eligibility. See `docs/banking_voice_agent_architecture.md` for the full,
+current picture and `to_do.md` for what is left. The mobile app is not yet
+connected to it.
+
+**Quickest ways to try it locally**
+
+```
+docker compose up -d postgres redis
+python -m database.migrate && python -m scripts.seed_sample_data
+python main.py                      # chat in the terminal (/lang hi-IN, /new, /reset, /quit)
+python -m uvicorn main:app --port 8000   # the API; test page at http://localhost:8000/docs
+```
+
+Sections 9 and below describe the early phases (the `/api/v1/query` debug route
+needs `ENABLE_DEBUG_ROUTES=true`); the real app routes are `/auth/*`,
+`/api/v1/sessions`, `/api/v1/sessions/{id}/messages`, `/api/v1/me/profile`,
+`/api/v1/transcribe` and `/api/v1/admin/documents*`.
 
 ## 1. Prerequisites
 
@@ -25,8 +40,15 @@ Create a `.env` file at the repo root:
 ```
 DATABASE_URL=postgresql://sahayak:sahayak@localhost:5432/sahayak
 REDIS_URL=redis://localhost:6379/0
-GROQ_API_KEY=<your Groq key>
+GROQ_API_KEY=<your Groq key>        # several keys may be comma separated (used round-robin)
+JWT_SECRET=<random string>          # required; python -c "import secrets; print(secrets.token_urlsafe(48))"
+ADMIN_API_KEY=<random string>       # protects /api/v1/admin/* and /health/deps
+EMBEDDING_API_KEY=<Gemini key>      # optional: RAG embeddings (keyword search is used without it)
+ENABLE_DEBUG_ROUTES=true            # local only; must be false when deployed
+AUTO_SETUP=false                    # true on a fresh cloud DB: migrate + seed + sync documents on start
 ```
+
+Copy `.env.example` for the full list.
 
 (`DATABASE_URL`/`REDIS_URL` have working defaults in `settings.py` if you
 don't set them — only `GROQ_API_KEY` is required for worker-agent features

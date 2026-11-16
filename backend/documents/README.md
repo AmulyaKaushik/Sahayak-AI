@@ -11,6 +11,7 @@ Drop the PDFs here, then run (from `backend/`):
     documents/
       home_loan/loan_policy.pdf          -> scheme_id "home_loan"
       kisan_credit_card/kcc_guide.pdf    -> scheme_id "kisan_credit_card"
+      home_loan.pdf                      -> scheme_id "home_loan" (a top-level file named after a scheme id)
       general_banking_faq.pdf            -> no scheme (searched for every scheme)
 
 Valid folder names: sukanya_samriddhi, pm_jan_dhan_yojana,
@@ -19,6 +20,8 @@ senior_citizen_savings_scheme, pm_mudra_yojana_shishu, home_loan,
 atal_pension_yojana.
 
 Rules:
+- On the cloud, `AUTO_SETUP=true` runs this sync on every start in the background, so the PDFs
+  must be committed (they are baked into the image). A new PDF needs `EMBEDDING_API_KEY`.
 - Text PDFs only. Scanned PDFs are reported as `needs_ocr` and skipped.
 - Already-ingested files (same content) are skipped, so running the sync
   again is safe. Moving a file into a scheme folder re-tags it (no re-embedding).

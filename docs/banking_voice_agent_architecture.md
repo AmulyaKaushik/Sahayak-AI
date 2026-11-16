@@ -2,7 +2,7 @@
 
 Multilingual, voice-first assistant that tells customers which bank loans and government schemes they qualify for, and answers questions about what the official documents say. Originally designed as a branch kiosk; **now delivered as a mobile app (Expo / React Native) talking to a cloud-hostable FastAPI backend.**
 
-*Last updated: 2026-11-15. This document started as the frozen design; it now records the design **as built**, what changed from the original plan and why, the known issues, and what is still to do. Sections 9, 12 and 13 are the quickest way to see where the project stands.*
+*Last updated: 2026-11-16. This document started as the frozen design; it now records the design **as built**, what changed from the original plan and why, the known issues, and what is still to do. Sections 9, 12 and 13 are the quickest way to see where the project stands.*
 
 ---
 
@@ -15,14 +15,19 @@ Multilingual, voice-first assistant that tells customers which bank loans and go
 | Auth (register / login / refresh, JWT), server-owned sessions | **Done, tested** |
 | Sahayak_AI layer (router → agents → refiner) | **Done, tested live** |
 | Eligibility agent (fact extraction → rules → reply) | **Done, tested live** |
-| RAG agent + PDF ingestion + folder sync (Gemini embeddings, pgvector) | **Done, verified with one real PDF** |
-| Speech-to-text proxy (Groq Whisper behind the backend) | **Done** (not yet used by the app) |
-| Backend test suite | **109 passing** (about 13–80 s depending on Groq load) |
-| Cloud deployment | **Not done** (runs locally via Docker Compose) |
+| RAG agent + PDF ingestion + folder sync (Gemini embeddings, pgvector, keyword-search fallback) | **Done; all 10 PDFs ingested and spot-checked** |
+| Speech-to-text proxy (Groq Whisper behind the backend) | **Done** (not yet used by the app; not tested with real audio on Render) |
+| Groq key rotation (round-robin over several keys) | **Done** |
+| LLM-free fallback for eligibility (regex facts, keyword routing, cached rules) | **Done, tested** |
+| Forbidden-field guard (PIN / OTP / CVV / password / card number) in chat | **Done** |
+| Short spoken replies (refiner summaries) | **Done** |
+| Terminal chat (`python main.py`) | **Done** |
+| Backend test suite | **126 passing** (about 12–25 s; some tests call live Groq) |
+| Cloud deployment (demo) | **Deployed on Render** (Docker) with Supabase Postgres + Upstash Redis; register, login, chat, RAG, Hindi, profile and security checks verified over HTTPS. Replies take 6–11 s there (section 11) |
 | Mobile app ↔ backend connection | **Not done** — app still runs on its built-in mock |
-| Offline resilience, forbidden-field guard, rule proposals from documents, PII-safe logging | **Not built** |
+| On-device offline mode, rule proposals from documents, PII-safe logging, connection pooling | **Not built** |
 
-**Verdict:** the backend is functionally complete for the core flow and works end to end against the real Groq and Gemini services. It is **not yet ready to be connected to the app**: the app needs login screens, token handling and the new response contract, and several backend gaps (section 12, items marked High) should be closed first.
+**Verdict:** the backend is functionally complete for the core flow, is deployed for a demo, and works end to end against the real Groq and Gemini services. The one big missing piece is the **mobile app connection**: the app still needs login screens, token handling and the new response contract (section 13, R3). The remaining High issues are H1 (non-English verdict check) and H3 (Groq free-tier limits).
 
 ---
 
@@ -35,9 +40,9 @@ Rural customers often don't know which bank/government schemes or loan products 
 | Constraint | Status |
 |---|---|
 | Every eligibility decision is deterministic, versioned and auditable — never an LLM guess | **Met.** Only `eligibility_engine` decides; rules are versioned rows in Postgres. |
-| Sensitive data (PIN, password, OTP) is never requested or stored by the agent | **Not enforced in code yet.** There is no forbidden-field guard (open issue H2). |
+| Sensitive data (PIN, password, OTP) is never requested or stored by the agent | **Met for chat.** A message containing a PIN, OTP, CVV, password or card number is refused before any model sees it and nothing is stored (`sahayak_ai/orchestrator.py`). The profile API only accepts known profile fields. |
 | No dependency on the customer's own device or internet | **Dropped by design.** The product is now a phone app, so the customer's phone and connectivity are required. |
-| Must still answer correctly if the connection drops (offline-first) | **Not met / needs re-scoping.** The backend is cloud-only; on the phone only text-to-speech works offline. See section 13. |
+| Must still answer correctly if the connection drops (offline-first) | **Partly met.** The backend still needs the internet, but eligibility checks keep working when the *LLM* is unreachable (regex facts + keyword routing + cached rules, section 4.11). Document answers still need the LLM. On the phone only text-to-speech works offline. |
 
 **Decision recorded:** moving from a kiosk to a mobile app changes the identity model. A kiosk could trust card-reader hardware; a phone cannot. The customer now registers with phone-or-email + password and receives JWTs. (`connect.md` section 11 notes the same.)
 
@@ -50,7 +55,7 @@ Rural customers often don't know which bank/government schemes or loan products 
 3. **Single writer.** *(Unchanged.)* Only the supervisor pipeline writes the session context; only `db_manager` writes profiles and facts.
 4. **Two separate stores.** *(Unchanged.)* Redis for per-conversation context, ownership and tokens; Postgres for profiles, facts, rules, users and documents.
 5. **Grounded answers only.** *(New.)* The RAG agent answers only from retrieved passages; if nothing is similar enough it says it could not find the answer rather than guess.
-6. **Offline-first, cloud-enhanced.** *(Not achieved — see section 1 and 13.)*
+6. **Degrade, don't fail.** *(Partly achieved.)* If the LLM is down, eligibility still answers from regex-extracted facts, keyword routing and cached rules; if the embedding service is down, documents are searched by keyword; a lookup failure is reported as "trouble looking that up", never as "not found". True on-device offline mode is not built.
 
 **What changed from the original plan, and why**
 
@@ -85,8 +90,8 @@ Rural customers often don't know which bank/government schemes or loan products 
         ▼      ▼                            ▼
    Eligibility agent                    RAG agent
    (eligibility_agent/ →                (rag/agent.py)
-    supervisor/agent.py)                 embed question (Gemini)
-    1. extract facts (main LLM)          → pgvector search (loan_chunks / scheme_chunks)
+    supervisor/agent.py)                 embed question (Gemini; keyword search if unavailable)
+    1. extract facts (main LLM + regex)  → pgvector search (loan_chunks / scheme_chunks)
        ∥ resolve target scheme           → main LLM answers ONLY from passages
     2. save facts per customer           → {answer | None, sources, confidence}
     3. deterministic rules engine
@@ -100,12 +105,12 @@ Rural customers often don't know which bank/government schemes or loan products 
 
 **One chat turn, step by step** (`POST /api/v1/sessions/{id}/messages`)
 
-1. JWT checked; `customer_id` comes only from the token; the session must belong to that customer (else 403).
+1. JWT checked; `customer_id` comes only from the token; the session must belong to that customer (else 403). A message containing a PIN/OTP/password/card number is refused here, before any model sees it.
 2. **Router** (fast LLM): splits the message into 1–3 ordered sub-tasks, each `eligibility` or `rag`, each a **standalone** question naming its subject. It also decides `has_question` (asks vs. merely states a fact) and `scheme_id` (resolving "this loan" from the session's active scheme; left empty for "which loans…"). On any failure a keyword heuristic is used — a voice user never sees an error.
 3. **Orchestrator** runs the sub-tasks concurrently (at most one eligibility sub-task, because it is the single writer of session context). A crashed agent becomes a safe fallback reply.
-4. **Eligibility agent** (runs on its own thread so it never blocks the server): extracts facts against the union of every scheme's required fields, saves new facts to Postgres, then either checks the named / enumerated scheme(s) with the engine, or — if the message was only a fact — re-checks schemes discussed earlier that were still missing information.
+4. **Eligibility agent** (runs on its own thread so it never blocks the server): extracts facts from the customer's **original** message (not the router's shortened question, which used to drop facts) against the union of every scheme's required fields, with regex facts merged underneath the LLM's, saves new facts to Postgres, then either checks the named / enumerated scheme(s) with the engine, or — if the message was only a fact — re-checks schemes discussed earlier that were still missing information.
 5. **RAG agent**: answers document questions with sources (document + page).
-6. **Refiner**: English replies get a deterministic cleanup only (no LLM): "Rs 25,000" → "25,000 rupees", markdown stripped, raw ids replaced by friendly names. Non-English replies are translated by the fast LLM, with a guard that every number survives.
+6. **Refiner**: English replies get a deterministic cleanup only (no LLM): "Rs 25,000" → "25,000 rupees", markdown stripped, raw ids replaced by friendly names. Multi-scheme answers and plain facts are **summarised**: who you are eligible for, up to two closest schemes and what they still need, how many others are not yet eligible, and **one** thing to ask next. The full per-scheme detail stays in `results[]`. Non-English replies are translated by the fast LLM, with a guard that every number survives.
 7. Response: `reply_text` (spoken), `display_text` (on screen, with sources), `results[]`, `facts_updated[]`, `sources[]`, `turn_type`, plus `eligible` / `missing_fields` for the app's existing fields.
 
 Typical cost after optimisation: **2 LLM calls per eligibility turn, 2 per document question** (was 5–7 and 3).
@@ -128,13 +133,13 @@ Expo SDK app with expo-router, Zustand and axios. Working: microphone recording 
 - Debug routes that take `customer_id` from the body (`/profiles/*`, `/session-context/*`, `/api/v1/query`) exist only when `ENABLE_DEBUG_ROUTES=true` (default off; required by the older tests). **Must stay off in any deployment.**
 
 ### 4.3 Sahayak_AI (`sahayak_ai/`)
-`router.py` (one DSPy call, fast model, keyword fallback), `orchestrator.py`, `refiner.py`, `models.py`. It holds no business logic. Friendly naming lives in `workers/friendly.py` (scheme and requirement names; unknown ids degrade to readable text).
+`router.py` (one DSPy call, fast model, keyword fallback), `orchestrator.py` (also the secret-message guard), `refiner.py` (cleanup, translation, `summarize_eligibility`), `models.py`. It holds no business logic. Friendly naming lives in `workers/friendly.py` (scheme and requirement names; unknown ids degrade to readable text).
 
 ### 4.4 Eligibility agent (`eligibility_agent/`, `supervisor/agent.py`)
-Wraps `run_query_pipeline`. Per turn: fact extraction (against all required fields) → persist facts → classify turn (question / fact) → resolve target scheme(s) only when not already pinned → engine check → templated reply. A message that is only a fact re-checks earlier-discussed unresolved schemes using facts known **before** the turn, so the scheme the fact just resolved is still reported. Stated facts are saved even when the question can't be routed.
+Wraps `run_query_pipeline` (takes `facts_text`, the customer's original message, for fact extraction). Per turn: fact extraction (against all required fields) → persist facts → classify turn (question / fact) → resolve target scheme(s) only when not already pinned → engine check → templated reply. A message that is only a fact re-checks earlier-discussed unresolved schemes using facts known **before** the turn, so the scheme the fact just resolved is still reported. Stated facts are saved even when the question can't be routed. `supervisor/offline.py` provides `extract_facts_regex` (age, monthly income incl. "40k" / "6 lakh per year", dependents, land, employment type, yes/no facts; a new amount replaces the saved one) and `keyword_target_scheme_ids` (which loans/schemes a question names). Regex facts are always merged under the LLM's, and are used alone when the LLM fails. Each result also carries `ask[]`, the fields still needed.
 
 ### 4.5 Deterministic rules engine (`eligibility_engine/`)
-Condition trees (AND/OR) over fields, three-valued logic so "unknown" never becomes "eligible". Versioned, append-only rows in `eligibility_rules`. Output: `eligible`, `satisfied[]`, `missing[]`, `completion_fraction`, `confidence`, `rule_source`, `rule_updated_at`. A stored value of the wrong type is treated as "unknown" instead of crashing.
+Condition trees (AND/OR) over fields, three-valued logic so "unknown" never becomes "eligible". Versioned, append-only rows in `eligibility_rules`. Output: `eligible`, `satisfied[]`, `missing[]`, `completion_fraction`, `confidence`, `rule_source`, `rule_updated_at`. A stored value of the wrong type is treated as "unknown" instead of crashing. Active rules are cached in memory for 5 minutes, and a cached rule is used if the database cannot be reached.
 **Nine schemes encoded:** `sukanya_samriddhi`, `pm_jan_dhan_yojana`, `pmay_rural_housing_subsidy`, `kisan_credit_card`, `retail_micro_loan`, `senior_citizen_savings_scheme`, `pm_mudra_yojana_shishu`, `home_loan`, `atal_pension_yojana`.
 `confidence` is a placeholder (1.0). Per-scheme partial-eligibility thresholds exist in `eligibility_engine/threshold.py` but **the "you'd qualify if…" message is not yet used in replies**.
 
@@ -145,21 +150,22 @@ Condition trees (AND/OR) over fields, three-valued logic so "unknown" never beco
 Redis list per session: summary, fields collected, schemes discussed, `active_scheme_id`. Read-only for everything except the supervisor.
 
 ### 4.8 RAG (`rag/`)
-- **Retrieval:** Gemini `gemini-embedding-001` (768 dimensions, multilingual) → cosine search in `loan_chunks` / `scheme_chunks` (two physical tables = two vector spaces) → top 5, minimum similarity 0.45. When a scheme is active the search covers chunks tagged for that scheme **plus untagged chunks**.
-- **Answering:** main LLM, only from the numbered passages, in complete sentences; empty answer → "not found". Returns sources (document + page) and confidence.
+- **Retrieval:** Gemini `gemini-embedding-001` (768 dimensions, multilingual; retried on 429/5xx) → cosine search in `loan_chunks` / `scheme_chunks` (two physical tables = two vector spaces) → top 5, minimum similarity 0.45. When a scheme is active the search covers chunks tagged for that scheme **plus untagged chunks**.
+- **Keyword fallback:** if there is no `EMBEDDING_API_KEY` or the embedding call fails, chunks are searched by Postgres full-text search (a scheme named in the question narrows it). Weaker than vectors, and poor for Hindi questions; new PDFs still need embeddings.
+- **Answering:** main LLM, only from the numbered passages, in complete sentences. Returns sources (document + page) and confidence. A genuinely empty answer → "not found"; an LLM or database failure → `unavailable=True` → "I am having trouble looking that up right now".
 - **Ingestion:** `pypdf` text per page → classify loan/scheme (fast LLM, confidence ≥ 0.7 else `needs_review`) → heading-aware chunking (≈2400 chars, 400 overlap) → embed → store. Statuses: `processing → active | needs_review | needs_ocr | embedding_failed`.
-- **Folder sync:** put PDFs in `backend/documents/<scheme_id>/…` (top-level files have no scheme) and run `python -m rag.folder_sync`, or `POST /api/v1/admin/documents/sync`. Files are recognised by content hash, so re-running never duplicates; a file moved into a scheme folder is re-tagged without re-embedding; failed embeddings are retried. Unknown folder names and non-PDF content are reported, not ingested.
-- **Verified** with one real PDF (Sukanya Samriddhi factsheet): correct answers with page citations for documents required, yearly deposit limit, minimum deposit, maturity; "not found" for out-of-scope questions; Hindi questions answered in Hindi.
+- **Folder sync:** put PDFs in `backend/documents/<scheme_id>/…` (a top-level file takes its scheme from its name, e.g. `home_loan.pdf`; other names have no scheme) and run `python -m rag.folder_sync`, or `POST /api/v1/admin/documents/sync`. Files are recognised by content hash, so re-running never duplicates; a file moved into a scheme folder is re-tagged without re-embedding; failed embeddings are retried. Unknown folder names and non-PDF content are reported, not ingested.
+- **Verified** with all 10 PDFs (one per scheme): correct, cited answers for documents required, deposit limits, credit limits, pension amounts, tenures; "not found" for out-of-scope questions; Hindi questions answered in Hindi; also verified on the Render deployment.
 
 ### 4.9 Speech (`speech/api.py`)
-`POST /api/v1/transcribe` forwards audio to Groq Whisper (`whisper-large-v3`) with the server-side key, drops segments Whisper itself flags as silence, and maps the detected language to BCP-47. Text-to-speech stays on the phone.
+`POST /api/v1/transcribe` forwards audio to Groq Whisper (`whisper-large-v3`) with a server-side key (taken round-robin from `GROQ_API_KEY` / `GROQ_API_KEYS`, `workers/keys.py`; the LLM calls rotate the same way), drops segments Whisper itself flags as silence, and maps the detected language to BCP-47. Text-to-speech stays on the phone.
 
 ### 4.10 Security layer
 Done: JWT with typed tokens, scrypt, rate-limited login, session ownership, admin key, PII-free error shape, debug routes off by default, secrets kept in a git-ignored `.env`.
-Not done: forbidden-field guard (PIN/OTP/CVV/password), PII-redacted logging, corroboration of self-reported facts against bank records (section 12).
+Also done: forbidden-field guard for chat (PIN/OTP/CVV/password/card number). Not done: PII-redacted logging, per-user rate limits on chat/transcribe, corroboration of self-reported facts against bank records (section 12).
 
-### 4.11 Offline layer (`offline/`)
-Empty package. Not built (section 13).
+### 4.11 Degraded-mode layer
+`offline/` is still an empty package (no on-device mode). What exists instead is the server-side fallback described above: cached rules, regex facts and keyword routing for eligibility; keyword search for documents; `unavailable` instead of "not found"; startup that survives a failed setup (`AUTO_SETUP`, `bootstrap.py`: migrate, seed missing rules, sync documents in the background). Remaining limit: if the **database** is unreachable, saved facts can't be read, so a check fails.
 
 ---
 
@@ -211,13 +217,14 @@ All routes except `/auth/*`, `/health` need `Authorization: Bearer <access_token
 |---|---|
 | Backend | Python 3.13, FastAPI, Pydantic |
 | LLM | Groq via DSPy: `openai/gpt-oss-120b` (extraction, target resolution, RAG answers), `openai/gpt-oss-20b` (routing, document classification, translation), `reasoning_effort=low` |
-| Embeddings | Google Gemini `gemini-embedding-001`, 768-d |
+| Embeddings | Google Gemini `gemini-embedding-001`, 768-d (optional at query time: keyword-search fallback) |
 | Speech | Groq Whisper (STT, via backend); `expo-speech` (TTS, on device) |
 | Data | PostgreSQL 16 + pgvector; Redis 7 |
 | Auth | JWT (PyJWT), scrypt |
 | PDF | `pypdf` (text PDFs only) |
 | Mobile | Expo / React Native, expo-router, Zustand, axios |
-| Packaging | Dockerfile + `docker-compose.yml` (`pgvector/pgvector:pg16`, `redis:7-alpine`, app) |
+| Packaging | Dockerfile (honours `$PORT`) + `docker-compose.yml` (`pgvector/pgvector:pg16`, `redis:7-alpine`, app) |
+| Hosting (demo) | Render (Docker web service, root directory `backend`), Supabase Postgres via the **Session pooler**, Upstash Redis (`rediss://`) |
 
 ---
 
@@ -225,13 +232,14 @@ All routes except `/auth/*`, `/health` need `Authorization: Bearer <access_token
 
 ```
 backend/
-  main.py                    app, routers, error shape, health
+  main.py                    app, routers, error shape, health; `python main.py` = terminal chat
+  bootstrap.py               AUTO_SETUP: migrate + seed missing rules + sync documents
   settings.py                all configuration (env-driven)
   sahayak_ai/                router, orchestrator, refiner, models, api (chat routes)
   eligibility_agent/         fixed interface over the supervisor pipeline
-  supervisor/                run_query_pipeline, context store, debug routes
+  supervisor/                run_query_pipeline, context store, offline.py (regex facts, keyword routing), debug routes
   eligibility_engine/        rules, evaluator, threshold, calculators, seed
-  workers/                   Loan/Scheme agent classes, friendly names, narration guard
+  workers/                   Loan/Scheme agent classes, friendly names, narration guard, keys.py (Groq key rotation)
   mcp_servers/               MCP wrappers (engine, calculators, DB) — not on the live path
   rag/                       agent, ingestion, folder_sync, chunking, embeddings, repository, api
   security/                  auth, passwords, sessions, rate_limit, admin, repository
@@ -241,7 +249,7 @@ backend/
   database/                  connection, migrations
   documents/                 drop PDFs here (sub-folder = scheme_id)
   document_ingestion/, offline/   empty placeholders
-  tests/                     109 tests
+  tests/                     126 tests
 sahayak-mobile/              Expo app
 docs/                        this file, mobile_voice_client_plan.md
 connect.md                   frontend ↔ backend connection plan
@@ -264,21 +272,21 @@ connect.md                   frontend ↔ backend connection plan
 | 8 Document ingestion + rule proposals | Upload → classify → embed + draft rules → human review | **Partial** — upload, classify, embed, review of document type done; **rule proposals not built** |
 | 9 Voice layer | LangID → STT → … → TTS | **Partial** — STT proxy done, TTS on phone; app not yet using the proxy; no Bhashini/local fallback |
 | 10 Offline-first | Local cache, local STT/TTS, sync queue | **Not started** |
-| 11 Security hardening | Forbidden fields, PII redaction, corroboration | **Partial** — auth/session isolation done; the rest not started |
-| 12 Reasoning & benefits polish | Narration quality, partial-eligibility message | **Partial** — friendly wording done; benefits and "you'd qualify if…" not done |
+| 11 Security hardening | Forbidden fields, PII redaction, corroboration | **Partial** — auth/session isolation and the chat forbidden-field guard done; PII redaction, rate limits, corroboration not started |
+| 12 Reasoning & benefits polish | Narration quality, partial-eligibility message | **Partial** — friendly wording and short summaries done; benefits and "you'd qualify if…" not done |
 | 13 Kiosk UX / printed summary | Take-home slip, teller handoff | **Not started** (kiosk-specific; re-scope for mobile) |
 | 14 Testing & demo prep | Regression suite, demo script | **Partial** — suite exists; no offline test, no demo script, no CI |
 | *New* — Mobile client | App per `mobile_voice_client_plan.md` | **Phases A–E done against a mock; Phase F (real backend) not done** |
-| *New* — Cloud deployment | Neon/Upstash/Render per `connect.md` | **Not started** |
+| *New* — Cloud deployment | Supabase / Upstash / Render | **Done for a demo** (verified over HTTPS); no pooling, free tier sleeps |
 
 ---
 
 ## 10. Testing
 
-- **109 tests pass.** Coverage: rules engine and threshold, MCP tools, profile versioning, session context, auth (register/login/refresh, typed tokens, rate limit, session ownership, admin key), router/refiner/chunking/password units, friendly wording, profile-value validation, engine type-safety, non-blocking eligibility agent, RAG scheme filter, folder sync, and end-to-end query-pipeline regressions.
+- **126 tests pass.** Coverage: rules engine and threshold, MCP tools, profile versioning, session context, auth (register/login/refresh, typed tokens, rate limit, session ownership, admin key), router/refiner/chunking/password units, friendly wording, profile-value validation, engine type-safety, non-blocking eligibility agent, RAG scheme filter, folder sync, key rotation, regex facts and keyword routing, the no-LLM eligibility path (a new amount replaces the saved one), cached rules when the DB is down, RAG failure handling (keyword fallback, `unavailable`), short summaries, the secret-message guard, and end-to-end query-pipeline regressions.
 - **Caveat:** the query-pipeline and worker tests call the **real Groq API** (needs `GROQ_API_KEY`, network, and consumes the free-tier quota). They can be slow or flaky under rate limiting, and running the suite right before a live chat can throttle the chat.
-- RAG verification was done by hand with one PDF (not an automated test).
-- Not tested: Hindi verdict correctness, load/concurrency beyond a single event-loop check, the mobile app against the real backend, deployment.
+- RAG verification was done by hand with all 10 PDFs (not an automated test). The Render deployment was checked by hand over HTTPS: health, register, login, wrong password, refresh, missing token, profile schema/get/patch/bad value, sessions, eligibility chat, document chat, Hindi chat, PIN refusal, other user's session (403), transcribe without a file (422), debug and admin routes locked (404/401).
+- Not tested: Hindi verdict correctness, load/concurrency beyond a single event-loop check, the mobile app against the real backend, speech-to-text with real audio on Render, the admin document list on Render.
 
 ## 11. Performance & Rate Limits (measured)
 
@@ -291,7 +299,9 @@ connect.md                   frontend ↔ backend connection plan
 
 What produced it: removed the worker round-trip whose output was discarded; merged two classifiers into one; let the router decide question-vs-fact; ran independent calls concurrently; used a smaller model for routing/translation; English replies need no LLM rewrite; eligibility runs off the event loop (`/health` answered in 19 ms during a chat turn).
 
-**The binding constraint is Groq's free tier: 8,000 tokens per minute per model** (checked from response headers). Bursts of chat plus the test suite exhaust it and each call then waits for the minute to reset (seen as 14–31 s turns). Splitting work across two models roughly doubles the headroom; a paid/dev-tier key removes the limit.
+**On Render (measured 2026-11-16):** chat turns took 6–11 s, against 1–3 s locally. Likely causes (not yet confirmed): every database call opens a **new connection** with a TLS handshake to Supabase (a turn makes 10–20 calls), and the Render/Supabase regions may differ. A connection pool (`psycopg_pool`) is the planned fix. The first request after the free tier sleeps took ~42 s.
+
+**The binding constraint is Groq's free tier: 8,000 tokens per minute per model** (checked from response headers). Bursts of chat plus the test suite exhaust it and each call then waits for the minute to reset (seen as 14–31 s turns). Splitting work across two models roughly doubles the headroom, and every extra key in `GROQ_API_KEYS` adds another full allowance (calls rotate round-robin); a paid/dev-tier key removes the limit.
 
 ---
 
@@ -310,17 +320,22 @@ What produced it: removed the worker round-trip whose output was discarded; merg
 | 5–7 LLM calls per turn, 2 of them wasted | See section 11 |
 | Failures swallowed silently (RAG, router, refiner, orchestrator) | Warnings logged with tracebacks |
 | Folder of PDFs needed by hand-upload | `documents/` folder + sync (CLI and API) |
+| **H2** no forbidden-field guard | Chat messages with a PIN/OTP/CVV/password/card number are refused before any model sees them |
+| **H4** RAG said "not found" on any failure | `unavailable` flag → "trouble looking that up"; failures logged |
+| **H5** embeddings had no retry and one provider | Retries with back-off; keyword search when embeddings are unavailable |
+| **H6** nothing migrated/seeded on start | `AUTO_SETUP=true` runs migrations, seeds missing rules, syncs documents; a failed setup does not stop the server |
+| Facts in a question were lost ("I am a farmer, which loans…" saved nothing) | Router used to shorten the message before extraction; extraction now reads the original message, plus regex facts and extractor prompt with allowed values |
+| Noisy, very long multi-scheme replies and replies to plain facts | Refiner summaries (M6 mostly fixed) |
+| "Which loans and schemes…" returned "not sure" | Target resolver can answer `both` |
+| Rupee amounts read as "1,000, rupees 2,000, rupees" | Fixed in `humanize` |
 
 ### Open — High
 | ID | Issue | Impact / suggested fix |
 |---|---|---|
 | H1 | **Non-English replies skip the verdict check.** The refiner verifies the eligible/not-eligible phrase only for English; for Hindi etc. only numbers are checked | A translation could flip "not eligible". Fix: translate **templated** sentences per language instead of using the LLM, or check the verdict in each language |
-| H2 | **No forbidden-field guard** (PIN, OTP, CVV, password) | Violates a hard constraint; a customer could state an OTP and it could be extracted and stored. Fix: reject at extraction and at the profile API |
 | H3 | **Groq free-tier throttling** (8,000 tokens/min/model) | Latency spikes under load. Fix: dev-tier key; retries with backoff; per-user rate limits |
-| H4 | **RAG says "not found" on any LLM/embedding failure**, including rate limits | Misleading to users. Fix: distinguish "not in documents" from "temporarily unavailable"; retry on 429 |
-| H5 | **Embedding calls have no retry/backoff and one provider (Gemini)** | A large upload can end `embedding_failed` on a rate limit. Fix: throttle + retry; provider switch (e.g. Jina) |
-| H6 | **Nothing runs migrations or seeds the rules on start-up** | A fresh cloud database has no rules, so every eligibility check fails. Fix: run both on boot or in the release command |
-| H7 | **Not deployed**; app not connected | See section 13 |
+| H7 | **Mobile app not connected** to the (now deployed) backend | See section 13, R3 |
+| H8 | **Slow replies on the cloud (6–11 s)**: a new database connection per call | Add a connection pool; check that Render and Supabase are in the same region |
 
 ### Open — Medium
 | ID | Issue |
@@ -330,7 +345,7 @@ What produced it: removed the worker round-trip whose output was discarded; merg
 | M3 | Only the latest refresh token per customer is valid (logging in on a second phone signs out the first); two simultaneous refreshes make the second fail — the app must serialise refreshes |
 | M4 | No logout/revoke endpoint, password reset, or account deletion; phone/email not validated or normalised (`+91 99999…` and `99999…` become two accounts) |
 | M5 | Session ownership expires after 24 h (→ 403, the app must start a new session) but `session_context:*` has no TTL and grows forever |
-| M6 | Voice UX: multi-scheme answers read as long paragraphs; the refiner can add extras ("Do you want to ask another question?"); "Not met yet" mixes unmet requirements with unknown ones |
+| M6 | Voice UX: much improved by the summaries; the refiner can still add extras in non-English replies; "still needs" mixes unmet requirements with unknown ones |
 | M7 | Partial-eligibility ("you'd qualify if…") not used in replies; engine `confidence` is a placeholder 1.0; no benefits/explanations beyond the document answers |
 | M8 | Field prompts and eligibility sentences are English; other languages rely on LLM translation |
 | M9 | Self-reported facts are trusted as given (no corroboration with bank records) |
@@ -338,6 +353,11 @@ What produced it: removed the worker round-trip whose output was discarded; merg
 | M11 | No OCR: scanned PDFs end `needs_ocr` and are skipped |
 | M12 | No automated tests run without live Groq; no CI |
 | M13 | Logging is minimal; no PII redaction, no metrics |
+| M14 | Free-tier hosts sleep when idle; the first request can take 30–60 s (and ~512 MB RAM may be tight with DSPy/LiteLLM) |
+| M15 | Keyword document search is weaker than vector search and poor for non-English questions; adding a *new* PDF still needs an embedding key |
+| M16 | Regex facts only know common phrasings; "I have 6000" is read as monthly income (the only money fact) |
+| M17 | Key rotation is per call, not on error: a key that is already throttled still receives its turn |
+| M18 | Offline mode needs the database: if Postgres is unreachable, saved facts cannot be read |
 
 ### Open — Low
 - Chunk overlap can start mid-word (`ent from time to time…`); retrieval still works.
@@ -350,15 +370,12 @@ What produced it: removed the worker round-trip whose output was discarded; merg
 
 ## 13. What Still Needs To Be Done (recommended order)
 
-**R1 — Make the backend safe to connect** (small, mostly independent)
-1. Verdict-safe translation for non-English replies (H1).
-2. Forbidden-field guard (H2).
-3. RAG: separate "not found" from "unavailable", retry on rate limits (H4); embedding retry + provider switch (H5).
-4. Run migrations and seed rules automatically on start (H6).
-5. Rate limits on chat/transcribe and per-IP on auth (M1, M2).
+**R1 — Backend gaps still open** (small, mostly independent)
+1. Verdict-safe translation for non-English replies (H1). *Done already: forbidden-field guard (H2), RAG unavailable vs not found (H4), embedding retry + keyword fallback (H5), auto migrate/seed (H6).*
+2. Connection pool and region check to cut cloud latency (H8).
+3. Rate limits on chat/transcribe and per-IP on auth (M1, M2) — skippable for a demo.
 
-**R2 — Deploy**
-Neon (or Supabase) Postgres with pgvector, Upstash Redis, a container host with HTTPS (Render / Cloud Run), env vars from `connect.md` section 4.1, `ENABLE_DEBUG_ROUTES=false`, the `documents/` folder baked into the image or synced through the admin endpoint. Tolerate cold starts (60 s timeout, "waking up" message).
+**R2 — Deploy** — *done for a demo* (Render + Supabase Session pooler + Upstash, `AUTO_SETUP=true`, `ENABLE_DEBUG_ROUTES=false`, PDFs baked into the image). Still to do: keep the service warm before a demo, check the admin document list, and tolerate cold starts in the app (60 s timeout, "waking up" message).
 
 **R3 — Connect the mobile app** (`connect.md` section 3.4–8)
 - Dependencies/files: `expo-secure-store`, token store, auth store, login/register screens, route guard (`Stack.Protected`), onboarding + profile screens driven by `/profile/schema`.
@@ -391,16 +408,20 @@ python -m database.migrate                   # migrations 0001–0006
 python -m scripts.seed_sample_data           # rules (+ demo profiles)
 python -m uvicorn main:app --port 8000
 python -m rag.folder_sync                    # ingest PDFs from backend/documents/
-python -m pytest -q                          # 109 tests (some call real Groq)
+python -m pytest -q                          # 126 tests (some call real Groq)
+python main.py                               # chat in the terminal (/lang hi-IN, /new, /reset, /quit)
 ```
+On a fresh cloud database set `AUTO_SETUP=true` instead of running the migrate/seed/sync commands by hand.
 `backend/.env` (git-ignored; template in `.env.example`):
 
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL`, `REDIS_URL` | Postgres / Redis (cloud: Neon pooled URL, Upstash `rediss://`) |
 | `JWT_SECRET` | **Required**; `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
-| `GROQ_API_KEY` | LLM + speech-to-text |
-| `EMBEDDING_API_KEY` | Gemini key for RAG |
+| `GROQ_API_KEY` | LLM + speech-to-text; may hold several keys separated by commas |
+| `GROQ_API_KEYS` | Optional extra Groq keys (comma separated); all keys are used round-robin |
+| `AUTO_SETUP` | `true` = migrate, seed missing rules and sync `documents/` on every start |
+| `EMBEDDING_API_KEY` | Gemini key for RAG embeddings (optional: without it questions use keyword search and new PDFs cannot be embedded) |
 | `ADMIN_API_KEY` | Enables `/api/v1/admin/*` and `/health/deps` |
 | `ENABLE_DEBUG_ROUTES` | `true` only for local development and the legacy tests |
 | `WORKER_LLM_MODEL`, `FAST_LLM_MODEL`, `LLM_REASONING_EFFORT` | Model choices (defaults in `settings.py`) |
@@ -414,7 +435,8 @@ Quick end-to-end check with `curl`: see `connect.md` section 10.
 
 | Risk | Mitigation / status |
 |---|---|
-| Free-tier LLM and embedding limits stall the demo | Fewer calls per turn (done); dev-tier key; retries (R1); keep a rehearsed script |
+| Free-tier LLM and embedding limits stall the demo | Fewer calls per turn (done); several Groq keys (done); embedding retries and keyword fallback (done); dev-tier key; keep a rehearsed script |
+| The free Render service is asleep when the demo starts | Open `/health` a few minutes before; consider a paid instance |
 | A translated reply states the wrong verdict | Open (H1) — fix before demoing in Hindi to real users |
 | Wrong answers from documents | RAG refuses below similarity 0.45 and answers only from retrieved text; spot-check each new PDF |
 | Rule encoding for real schemes is slow and error-prone | Rules are hand-coded and versioned; Phase 8 review flow would help |

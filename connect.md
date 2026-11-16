@@ -1,5 +1,11 @@
 # Connecting the Sahayak Mobile App to the Backend
 
+> **Status (2026-11-16):** the backend side of this plan is done and deployed for a demo (Render + Supabase +
+> Upstash): JWT login, server-issued sessions, RAG, the Sahayak_AI router, profile API and the speech proxy.
+> **The mobile side (section 3.4 and sections 7-8) is not started.** Section 1 describes the state *before*
+> this work, so it is out of date. Current status: `docs/banking_voice_agent_architecture.md`; remaining work:
+> `to_do.md`.
+
 This is the plan for wiring `sahayak-mobile/` (Expo / React Native) to `backend/` (FastAPI),
 moving everything that currently runs on `localhost` into the cloud, and adding the three
 things that don't exist yet: **JWT login**, a **RAG agent**, and the **Sahayak_AI router**.
