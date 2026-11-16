@@ -1,3 +1,6 @@
+import logging
+import time
+
 from psycopg.types.json import Jsonb
 
 from database.db import get_connection
@@ -5,7 +8,34 @@ from eligibility_engine.conditions import collect_leaves
 from schemas.models import EligibilityRule
 
 
+logger = logging.getLogger(__name__)
+
+# Rules change rarely, so each is cached in memory. A cached rule is also what
+# keeps eligibility checks working when the database cannot be reached.
+_RULE_TTL_SECONDS = 300
+_rule_cache: dict[str, tuple[float, EligibilityRule | None]] = {}
+
+
+def clear_rule_cache() -> None:
+    _rule_cache.clear()
+
+
 def load_active_rule(scheme_id: str) -> EligibilityRule | None:
+    cached = _rule_cache.get(scheme_id)
+    if cached and time.monotonic() - cached[0] < _RULE_TTL_SECONDS:
+        return cached[1]
+    try:
+        rule = _load_active_rule_from_db(scheme_id)
+    except Exception:
+        if cached:
+            logger.warning("Rules: database unreachable; using cached rule for %s", scheme_id, exc_info=True)
+            return cached[1]
+        raise
+    _rule_cache[scheme_id] = (time.monotonic(), rule)
+    return rule
+
+
+def _load_active_rule_from_db(scheme_id: str) -> EligibilityRule | None:
     with get_connection() as conn:
         row = conn.execute(
             "SELECT scheme_id, version, conditions, source_document, approved_by, updated_at "
@@ -46,6 +76,7 @@ def upsert_and_activate(rule: EligibilityRule) -> None:
     scheme_id. Never mutates a previously inserted version's row in place --
     the eligibility_rules table is append-only per version (Phase 1 migration
     0003 comment)."""
+    _rule_cache.pop(rule.scheme_id, None)
     with get_connection() as conn:
         conn.execute(
             "UPDATE eligibility_rules SET is_active = false WHERE scheme_id = %s",

@@ -12,13 +12,27 @@ import dspy
 from mcp_servers.eligibility_server import mcp as eligibility_mcp
 from schemas.models import CustomerProfile
 from settings import settings
+from workers.keys import next_groq_key
 from workers.models import WorkerNarrationResult
 from workers.narration_guard import fallback_narration, narration_contradicts_verdict
 from workers.signatures import ExtractFields, NarrateEligibility
 
 
+def _lm(model: str) -> dspy.LM:
+    options = {}
+    if settings.llm_reasoning_effort:
+        options["reasoning_effort"] = settings.llm_reasoning_effort
+    return dspy.LM(model, api_key=next_groq_key(), **options)
+
+
 def build_lm() -> dspy.LM:
-    return dspy.LM(settings.worker_llm_model, api_key=settings.groq_api_key)
+    """The main model: fact extraction and answering from documents."""
+    return _lm(settings.worker_llm_model)
+
+
+def build_fast_lm() -> dspy.LM:
+    """The small model: routing, classification, rewording."""
+    return _lm(settings.fast_llm_model)
 
 
 class BaseWorkerAgent:

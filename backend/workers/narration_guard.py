@@ -9,8 +9,10 @@ This guard fires when the LLM answered but its prose contradicts the
 structured verdict, and falls back to a minimal deterministic sentence
 built only from the structured fields."""
 
+from workers.friendly import join_natural, requirement_label, scheme_name
+
 _POSITIVE_PHRASES = ("you are eligible", "you qualify", "you're eligible")
-_NEGATIVE_PHRASES = ("not eligible", "don't qualify", "do not qualify", "aren't eligible", "you're not eligible")
+_NEGATIVE_PHRASES = ("not eligible", "not yet eligible", "don't qualify", "do not qualify", "aren't eligible", "you're not eligible")
 
 
 def narration_contradicts_verdict(narration: str, eligible: bool) -> bool:
@@ -26,10 +28,16 @@ def narration_contradicts_verdict(narration: str, eligible: bool) -> bool:
 
 
 def fallback_narration(scheme_or_loan_name: str, eligible: bool, satisfied: list[str], missing: list[str]) -> str:
-    verdict = "you are eligible" if eligible else "you are not yet eligible"
-    sentence = f"Based on our records, {verdict} for {scheme_or_loan_name}."
+    """Plain deterministic sentence from the structured result. Takes raw ids
+    and writes customer-friendly names, so nothing like "retail_micro_loan"
+    ever reaches the screen or the speaker."""
+    name = scheme_name(scheme_or_loan_name)
+    if eligible:
+        sentence = f"You are eligible for {name}."
+    else:
+        sentence = f"You are not eligible for {name} yet."
     if satisfied:
-        sentence += f" Requirements met: {', '.join(satisfied)}."
+        sentence += f" You already meet: {join_natural([requirement_label(r) for r in satisfied])}."
     if missing:
-        sentence += f" Still needed: {', '.join(missing)}."
+        sentence += f" Not met yet: {join_natural([requirement_label(r) for r in missing])}."
     return sentence

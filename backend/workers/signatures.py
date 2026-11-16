@@ -9,7 +9,15 @@ class ExtractFields(dspy.Signature):
     """Extract structured field values the customer explicitly mentioned in
     their message. Only include a field in extracted_fields if it is in
     required_fields AND its value is actually stated in the message --
-    never guess or invent a value for a field that wasn't mentioned."""
+    never guess or invent a value for a field that wasn't mentioned.
+
+    Value formats: numbers as plain numbers (5 acres -> 5; "50k" -> 50000);
+    yes/no fields as true/false; employment_type must be exactly one of
+    "salaried", "self_employed", "farmer", "government_employee" (a person who
+    says they farm or are a farmer is "farmer"; a shopkeeper or business
+    owner is "self_employed"). The message may also contain a question;
+    ignore the question and extract only the facts the customer states about
+    themselves."""
 
     message: str = dspy.InputField()
     required_fields: list[str] = dspy.InputField(desc="Field names this worker is allowed to extract.")

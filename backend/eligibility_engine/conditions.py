@@ -37,7 +37,13 @@ def evaluate_leaf(node: dict, known_fields: dict[str, Any]) -> bool | None:
         return None
 
     op = _OPS[node["op"]]
-    return bool(op(known_fields[field_name], node["value"]))
+    try:
+        return bool(op(known_fields[field_name], node["value"]))
+    except TypeError:
+        # A stored value of the wrong type (e.g. "abc" for an age) can't be
+        # compared. Treat it as not known yet so the customer is asked again,
+        # instead of crashing every later check with a 500.
+        return None
 
 
 def evaluate_node(node: dict, known_fields: dict[str, Any]) -> bool | None:

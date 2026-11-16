@@ -40,21 +40,27 @@ on it. handle_query's signature/internals are untouched -- it never
 receives a reference to any store.
 """
 
+import asyncio
+import logging
 from typing import Literal
 
 import dspy
 from pydantic import BaseModel
 
-from db_manager.repository import get_known_fields, get_profile, upsert_extra_facts
+from db_manager.repository import get_known_fields, upsert_extra_facts
 from eligibility_engine.engine import check_eligibility
-from schemas.models import ContextEntry, CustomerProfile
+from schemas.models import ContextEntry
 from schemas.required_fields_seed import REQUIRED_FIELDS_ENTRIES, get_required_fields
 from supervisor.context_store import SessionContextStore
-from workers.base_worker import BaseWorkerAgent, build_lm
+from workers.base_worker import build_fast_lm, build_lm
+from workers.friendly import join_natural, scheme_name
 from workers.loan_agent.agent import LoanAgent
 from workers.narration_guard import fallback_narration
 from workers.scheme_agent.agent import SchemeAgent
+from supervisor.offline import extract_facts_regex, keyword_target_scheme_ids
 from workers.signatures import ExtractFields
+
+logger = logging.getLogger(__name__)
 
 ALL_REQUIRED_FIELDS: list[str] = sorted(
     {field for entry in REQUIRED_FIELDS_ENTRIES for field in entry.required_fields}
@@ -73,6 +79,8 @@ class SchemeResult(BaseModel):
     eligible: bool
     satisfied: list[str]
     missing: list[str]
+    # Fields the customer still has to give for this scheme (for the reply to ask).
+    ask: list[str] = []
 
 
 class QueryResponse(BaseModel):
@@ -82,32 +90,30 @@ class QueryResponse(BaseModel):
     turn_type: Literal["new_question", "recheck_unresolved", "acknowledgment"]
 
 
-class ClassifyDomain(dspy.Signature):
-    """Classify whether the customer's message is asking about a LOAN
-    product (credit, borrowing money) or a government/bank SCHEME (a
-    savings, subsidy, or welfare scheme). If the message is too ambiguous
-    or off-topic to confidently tell which, answer "unclear" rather than
-    guessing."""
+class ResolveTarget(dspy.Signature):
+    """Work out which loan(s) or scheme(s) the customer is asking about.
+
+    domain: "loan" (credit, borrowing money), "scheme" (a savings, subsidy
+    or welfare scheme) or "both" (ONLY when the customer says both words, loans AND schemes,
+    e.g. "which loans and schemes am I eligible for"; vague words like
+    "products" or "options" stay "unclear"). If the message is too ambiguous or off-topic to tell
+    which, answer "unclear" rather than guessing.
+
+    enumerate_all: True when the customer asks about ALL of them in that
+    domain ("which all loans am I eligible for", "what schemes can I get",
+    "which scheme am I eligible for" -- True even though "scheme" is
+    singular, because none is named). False only when ONE specific
+    loan/scheme is clearly named or unambiguously implied. If False, give
+    target_scheme_id from the ids listed for that domain; if you cannot
+    confidently match exactly one, use enumerate_all=True instead of
+    guessing. A fact the customer mentions about themselves (a child, an
+    income, land) is NOT the name of a scheme: only a loan/scheme actually
+    named, or referred to as "this one", makes enumerate_all False."""
 
     message: str = dspy.InputField()
-    domain: Literal["loan", "scheme", "unclear"] = dspy.OutputField()
-
-
-class ClassifyEnumerateMode(dspy.Signature):
-    """Decide whether the customer is asking about ONE specific named
-    loan/scheme, or ALL of them in this domain (e.g. "which all loans am I
-    eligible for", "what schemes can I get", "which scheme am I eligible
-    for" -- note this is enumerate_all=True too, even though it says
-    "scheme" singular, because no specific scheme is named). Only set
-    enumerate_all=False when a specific loan/scheme is clearly named or
-    unambiguously implied in the message. If asking about one specific one,
-    identify which scheme_id from available_scheme_ids it refers to. If you
-    cannot confidently match it to exactly one of available_scheme_ids,
-    default to enumerate_all=True rather than guessing a specific one."""
-
-    message: str = dspy.InputField()
-    domain: str = dspy.InputField(desc="'loan' or 'scheme'.")
-    available_scheme_ids: list[str] = dspy.InputField()
+    loan_scheme_ids: list[str] = dspy.InputField()
+    scheme_scheme_ids: list[str] = dspy.InputField(desc="Ids of the government/bank schemes.")
+    domain: Literal["loan", "scheme", "both", "unclear"] = dspy.OutputField()
     enumerate_all: bool = dspy.OutputField()
     target_scheme_id: str = dspy.OutputField(
         desc="Empty string if enumerate_all is True, or if no confident single match exists."
@@ -128,31 +134,10 @@ class ClassifyTurnIntent(dspy.Signature):
 
 
 _extract_all_fields = dspy.Predict(ExtractFields)
-_classify_domain = dspy.Predict(ClassifyDomain)
-_classify_enumerate = dspy.Predict(ClassifyEnumerateMode)
+_resolve_target = dspy.Predict(ResolveTarget)
 _classify_turn_intent = dspy.Predict(ClassifyTurnIntent)
 
 _context_store = SessionContextStore()
-
-
-def _default_profile(customer_id: str) -> CustomerProfile:
-    return CustomerProfile(
-        customer_id=customer_id,
-        monthly_income=None,
-        age=None,
-        dependents=None,
-        employment_type=None,
-        existing_products=[],
-        language_preference=None,
-    )
-
-
-def _worker_for_scheme(scheme_id: str) -> BaseWorkerAgent:
-    if scheme_id in LoanAgent.domain_scheme_ids:
-        return LoanAgent()
-    if scheme_id in SchemeAgent.domain_scheme_ids:
-        return SchemeAgent()
-    raise PipelineError("unknown_scheme", f"No worker handles scheme_id={scheme_id!r}")
 
 
 def _is_known(value) -> bool:
@@ -213,27 +198,20 @@ def _discussed_scheme_ids(entries: list[ContextEntry]) -> list[str]:
     return seen
 
 
-async def _check_schemes(
-    text: str, profile: CustomerProfile, scheme_ids: list[str], known_fields_base: dict
+def _check_schemes(
+    scheme_ids: list[str], known_fields: dict
 ) -> tuple[list[SchemeResult], list[str], list[str]]:
-    """Runs handle_query + the authoritative recompute for each scheme_id.
-    Returns (results, reply_sentences, workers_called_this_turn)."""
+    """Deterministic engine check per scheme_id. No LLM: the worker agents'
+    extra extraction and narration used to run here too, but their output was
+    discarded (facts were already extracted for every scheme this turn, and
+    the reply is built from the engine result). Returns (results,
+    reply_sentences, workers_called_this_turn)."""
     results: list[SchemeResult] = []
     reply_sentences: list[str] = []
-    workers_called: list[str] = []
 
     for scheme_id in scheme_ids:
-        worker = _worker_for_scheme(scheme_id)
-        required_fields = get_required_fields(scheme_id)
-        workers_called.append(scheme_id)
-
-        worker_result = await worker.handle_query(text, profile, scheme_id, required_fields)
-
-        # handle_query's own internal engine call never sees session/
-        # persisted/request-level facts (its signature is frozen -- see
-        # workers/base_worker.py). Recompute authoritatively here with
-        # everything merged, deterministically.
-        known_fields = {**known_fields_base, **worker_result.extracted_fields}
+        if not _is_known_scheme(scheme_id):
+            raise PipelineError("unknown_scheme", f"No worker handles scheme_id={scheme_id!r}")
         authoritative = check_eligibility(scheme_id, known_fields)
 
         results.append(
@@ -242,6 +220,7 @@ async def _check_schemes(
                 eligible=authoritative.eligible,
                 satisfied=authoritative.satisfied,
                 missing=authoritative.missing,
+                ask=[] if authoritative.eligible else _outstanding_fields(scheme_id, known_fields),
             )
         )
         sentence = fallback_narration(
@@ -251,14 +230,106 @@ async def _check_schemes(
             sentence += _missing_field_prompt(scheme_id, known_fields)
         reply_sentences.append(sentence)
 
-    return results, reply_sentences, workers_called
+    return results, reply_sentences, list(scheme_ids)
+
+
+def _is_known_scheme(scheme_id: str) -> bool:
+    return scheme_id in LoanAgent.domain_scheme_ids or scheme_id in SchemeAgent.domain_scheme_ids
+
+
+def _resolve_sync(text: str, lm):
+    with dspy.context(lm=lm):
+        return _resolve_target(
+            message=text,
+            loan_scheme_ids=LoanAgent.domain_scheme_ids,
+            scheme_scheme_ids=SchemeAgent.domain_scheme_ids,
+        )
+
+
+async def _resolve_target_scheme_ids(text: str, lm, active_scheme_id: str | None = None) -> list[str]:
+    try:
+        prediction = await asyncio.to_thread(_resolve_sync, text, lm)
+    except Exception:
+        # LLM unreachable (offline, rate limit): work it out from the words.
+        logger.warning("Supervisor: target LLM failed; using keywords", exc_info=True)
+        guess = keyword_target_scheme_ids(
+            text, LoanAgent.domain_scheme_ids, SchemeAgent.domain_scheme_ids, active_scheme_id
+        )
+        if guess:
+            return guess
+        raise PipelineError(
+            "domain_unclear",
+            "I'm having trouble understanding that right now. Please say the name of the "
+            "loan or scheme you want me to check.",
+        )
+    domain = prediction.domain
+
+    if domain == "both":
+        return list(LoanAgent.domain_scheme_ids) + list(SchemeAgent.domain_scheme_ids)
+
+    if domain not in ("loan", "scheme"):
+        raise PipelineError(
+            "domain_unclear",
+            "I'm not sure whether you are asking about a loan or a scheme. "
+            "Please say the name of the loan or scheme you want me to check.",
+        )
+
+    domain_ids = LoanAgent.domain_scheme_ids if domain == "loan" else SchemeAgent.domain_scheme_ids
+
+    if prediction.enumerate_all:
+        return list(domain_ids)
+
+    target_scheme_id = prediction.target_scheme_id
+    if target_scheme_id not in domain_ids:
+        raise PipelineError(
+            "scheme_unresolved",
+            f"I could not tell which {domain} you mean. I can check: "
+            f"{join_natural([scheme_name(s) for s in domain_ids])}.",
+        )
+    return [target_scheme_id]
+
+
+def _extract_sync(text: str, known_fields: dict, lm) -> dict:
+    with dspy.context(lm=lm):
+        return _extract_all_fields(
+            message=text, required_fields=ALL_REQUIRED_FIELDS, known_fields=known_fields
+        ).extracted_fields
+
+
+def _intent_sync(text: str, lm) -> bool:
+    with dspy.context(lm=lm):
+        return _classify_turn_intent(message=text).has_question
+
+
+def get_active_scheme_id(session_id: str) -> str | None:
+    """The scheme/loan this session is currently about (None if unknown)."""
+    entries = _context_store.read(session_id)
+    return entries[-1].active_scheme_id if entries else None
 
 
 async def run_query_pipeline(
-    customer_id: str, session_id: str, text: str, extra_fields: dict | None = None
+    customer_id: str,
+    session_id: str,
+    text: str,
+    extra_fields: dict | None = None,
+    scheme_id: str | None = None,
+    has_question: bool | None = None,
+    facts_text: str | None = None,
 ) -> QueryResponse:
+    """scheme_id, when given and known, pins the question to that scheme and
+    skips domain/enumerate classification (the caller has already resolved
+    it, e.g. from "this loan" + the session's active scheme).
+
+    has_question, when given (Sahayak_AI's router decides it), replaces the
+    separate "is this a question or a fact" LLM call.
+
+    The independent LLM calls of a turn (fact extraction, and target or
+    intent classification when needed) run at the same time.
+
+    facts_text, when given, is the customer's full original message: facts are
+    extracted from it, while `text` (the router's cleaned-up question) is used
+    for classification. Without it a rewritten question would lose the facts."""
     extra_fields = extra_fields or {}
-    profile = get_profile(customer_id) or _default_profile(customer_id)
 
     past_entries = _context_store.read(session_id)
     session_known_fields = _merge_session_known_fields(past_entries)
@@ -270,23 +341,41 @@ async def run_query_pipeline(
         **extra_fields,
     }
 
-    lm = build_lm()
+    smart_lm, fast_lm = build_lm(), build_fast_lm()
+    prior_active = past_entries[-1].active_scheme_id if past_entries else None
+    pinned = bool(scheme_id and _is_known_scheme(scheme_id))
 
-    # (a) Fact extraction first, unconditionally, against every scheme's
-    # required fields combined -- not just one "in-focus" scheme.
-    with dspy.context(lm=lm):
-        extraction = _extract_all_fields(
-            message=text, required_fields=ALL_REQUIRED_FIELDS, known_fields=baseline_known_fields
-        )
-    newly_extracted = extraction.extracted_fields
+    # (a) Fact extraction, unconditionally, against every scheme's required
+    # fields combined -- not just one "in-focus" scheme. Runs alongside the
+    # classification it doesn't depend on.
+    parallel = {"extract": asyncio.to_thread(_extract_sync, facts_text or text, baseline_known_fields, smart_lm)}
+    if has_question is None:
+        parallel["intent"] = asyncio.to_thread(_intent_sync, text, fast_lm)
+    elif has_question and not pinned:
+        parallel["target"] = _resolve_target_scheme_ids(text, smart_lm, prior_active)
+    outcome = dict(zip(parallel, await asyncio.gather(*parallel.values(), return_exceptions=True)))
+
+    # Regex facts are the safety net: they fill what the LLM missed ("I am a
+    # farmer") and are used alone when the LLM can't be reached. The LLM wins
+    # when both give the same field.
+    regex_facts = extract_facts_regex(facts_text or text)
+    if isinstance(outcome["extract"], BaseException):
+        logger.warning("Supervisor: extraction LLM failed; using regex facts", exc_info=outcome["extract"])
+        newly_extracted = regex_facts
+    else:
+        newly_extracted = {**regex_facts, **outcome["extract"]}
 
     # (b) Persist genuinely new/changed facts; merge into this turn's set.
+    # Done before surfacing a classification error, so a fact the customer
+    # stated is kept even when their question can't be routed.
     facts_written = upsert_extra_facts(customer_id, newly_extracted, source="conversation")
     known_fields = {**baseline_known_fields, **newly_extracted}
 
-    # (d) Classify what this turn is asking for.
-    with dspy.context(lm=lm):
-        has_question = _classify_turn_intent(message=text).has_question
+    # (d) What is this turn asking for?
+    if has_question is None:
+        if isinstance(outcome["intent"], BaseException):
+            raise outcome["intent"]
+        has_question = outcome["intent"]
 
     results: list[SchemeResult] = []
     reply_sentences: list[str] = []
@@ -296,37 +385,18 @@ async def run_query_pipeline(
     if has_question:
         turn_type = "new_question"
 
-        with dspy.context(lm=lm):
-            domain = _classify_domain(message=text).domain
-
-        if domain not in ("loan", "scheme"):
-            raise PipelineError(
-                "domain_unclear",
-                "Could not confidently tell whether this question is about a loan or a scheme. "
-                "Try mentioning 'loan' or the name of a specific scheme.",
-            )
-
-        domain_worker = LoanAgent() if domain == "loan" else SchemeAgent()
-
-        with dspy.context(lm=lm):
-            enumerate_prediction = _classify_enumerate(
-                message=text, domain=domain, available_scheme_ids=domain_worker.domain_scheme_ids
-            )
-
-        if enumerate_prediction.enumerate_all:
-            target_scheme_ids = list(domain_worker.domain_scheme_ids)
+        if pinned:
+            target_scheme_ids = [scheme_id]
         else:
-            target_scheme_id = enumerate_prediction.target_scheme_id
-            if target_scheme_id not in domain_worker.domain_scheme_ids:
-                raise PipelineError(
-                    "scheme_unresolved",
-                    f"Could not confidently match this question to a specific {domain} we cover. "
-                    f"Available options: {', '.join(domain_worker.domain_scheme_ids)}.",
-                )
-            target_scheme_ids = [target_scheme_id]
+            target = outcome["target"] if "target" in outcome else None
+            if target is None:  # the "is it a question" call ran first; resolve now
+                target = await _resolve_target_scheme_ids(text, smart_lm, prior_active)
+            if isinstance(target, BaseException):
+                raise target
+            target_scheme_ids = target
 
-        results, reply_sentences, workers_called_this_turn = await _check_schemes(
-            text, profile, target_scheme_ids, known_fields
+        results, reply_sentences, workers_called_this_turn = _check_schemes(
+            target_scheme_ids, known_fields
         )
     else:
         # No question in this turn -- re-check whatever discussed schemes
@@ -345,8 +415,8 @@ async def run_query_pipeline(
 
         if awaiting_before:
             turn_type = "recheck_unresolved"
-            results, reply_sentences, workers_called_this_turn = await _check_schemes(
-                text, profile, awaiting_before, known_fields
+            results, reply_sentences, workers_called_this_turn = _check_schemes(
+                awaiting_before, known_fields
             )
         else:
             turn_type = "acknowledgment"
@@ -358,6 +428,10 @@ async def run_query_pipeline(
 
     fields_collected_this_session = {**session_known_fields, **newly_extracted}
     prior_workers_called = past_entries[-1].workers_called if past_entries else []
+    prior_active_scheme_id = past_entries[-1].active_scheme_id if past_entries else None
+    active_scheme_id = (
+        workers_called_this_turn[0] if len(workers_called_this_turn) == 1 else prior_active_scheme_id
+    )
 
     _context_store.write(
         ContextEntry(
@@ -367,6 +441,7 @@ async def run_query_pipeline(
             fields_collected_this_session=fields_collected_this_session,
             workers_called=prior_workers_called + workers_called_this_turn,
             written_by="supervisor",
+            active_scheme_id=active_scheme_id,
         )
     )
 

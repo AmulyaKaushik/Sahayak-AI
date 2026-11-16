@@ -62,3 +62,6 @@ class ContextEntry(BaseModel):
     fields_collected_this_session: dict
     workers_called: list[str]
     written_by: Literal["supervisor"]  # enforced, never a worker
+    # The single scheme/loan the conversation is currently about, so a
+    # follow-up like "this loan" can be resolved. None when unknown.
+    active_scheme_id: str | None = None
