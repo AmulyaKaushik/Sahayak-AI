@@ -35,16 +35,20 @@ const LANGUAGE_TO_BCP47: Record<string, string> = {
 };
 const DEVANAGARI = /[ऀ-ॿ]/;
 
-export async function transcribe(audioUri: string): Promise<Transcript> {
-  return env.useMockStt ? transcribeMock() : transcribeGroq(audioUri);
+// languageHint: a BCP-47 tag ("hi-IN") when the user picked a language in
+// Settings, or undefined to let Whisper auto-detect.
+export async function transcribe(audioUri: string, languageHint?: string): Promise<Transcript> {
+  return env.useMockStt ? transcribeMock(languageHint) : transcribeGroq(audioUri, languageHint);
 }
 
-async function transcribeMock(): Promise<Transcript> {
+async function transcribeMock(languageHint?: string): Promise<Transcript> {
   await new Promise((resolve) => setTimeout(resolve, 1000));
-  return { text: 'मुझे होम लोन के बारे में जानकारी चाहिए', language: 'hi-IN' };
+  return languageHint === 'en-IN'
+    ? { text: 'I want information about a home loan', language: 'en-IN' }
+    : { text: 'मुझे होम लोन के बारे में जानकारी चाहिए', language: 'hi-IN' };
 }
 
-async function transcribeGroq(audioUri: string): Promise<Transcript> {
+async function transcribeGroq(audioUri: string, languageHint?: string): Promise<Transcript> {
   if (!env.groqApiKey) {
     throw new Error('EXPO_PUBLIC_GROQ_API_KEY is not set in .env.local');
   }
@@ -60,6 +64,8 @@ async function transcribeGroq(audioUri: string): Promise<Transcript> {
   form.append('model', GROQ_MODEL);
   // verbose_json includes the detected language, which plain json does not.
   form.append('response_format', 'verbose_json');
+  // Whisper takes ISO 639-1 ("hi"), not BCP-47 ("hi-IN").
+  if (languageHint) form.append('language', languageHint.split('-')[0]);
 
   try {
     const { data } = await axios.post<GroqResponse>(GROQ_URL, form, {
@@ -71,7 +77,7 @@ async function transcribeGroq(audioUri: string): Promise<Transcript> {
     const text = data.segments
       ? data.segments.filter((s) => !isLikelySilence(s)).map((s) => s.text).join('').trim()
       : data.text.trim();
-    return { text, language: resolveLanguage(data.language, text) };
+    return { text, language: languageHint ?? resolveLanguage(data.language, text) };
   } catch (e) {
     throw new Error(describeError(e));
   }
