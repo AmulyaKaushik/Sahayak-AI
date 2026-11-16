@@ -1,0 +1,57 @@
+# ---- Secrets: never commit these -------------------------------------------
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+*.pem
+*.key
+*.p8
+*.p12
+*.jks
+*.mobileprovision
+credentials*.json
+service-account*.json
+google-services.json
+GoogleService-Info.plist
+
+# ---- Python -------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node / Expo --------------------------------------------------------------
+node_modules/
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+*.tsbuildinfo
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+.metro-health-check*
+/sahayak-mobile/ios
+/sahayak-mobile/android
+
+# ---- Local data, logs, tools ---------------------------------------------------
+*.log
+*.sqlite
+*.sqlite3
+*.db
+pgdata/
+redisdata/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
