@@ -18,22 +18,13 @@ const GROQ_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
 const GROQ_MODEL = 'whisper-large-v3';
 const TIMEOUT_MS = 30_000;
 
-// Whisper reports the detected language either as an English name ("hindi")
-// or an ISO code ("hi") depending on the host. Map both to BCP-47 tags.
+// The app supports Hindi and English only. Whisper reports the detected
+// language as an English name ("hindi") or an ISO code ("hi") depending on
+// the host.
 const LANGUAGE_TO_BCP47: Record<string, string> = {
   hindi: 'hi-IN', hi: 'hi-IN',
   english: 'en-IN', en: 'en-IN',
-  bengali: 'bn-IN', bn: 'bn-IN',
-  marathi: 'mr-IN', mr: 'mr-IN',
-  tamil: 'ta-IN', ta: 'ta-IN',
-  telugu: 'te-IN', te: 'te-IN',
-  gujarati: 'gu-IN', gu: 'gu-IN',
-  kannada: 'kn-IN', kn: 'kn-IN',
-  malayalam: 'ml-IN', ml: 'ml-IN',
-  punjabi: 'pa-IN', pa: 'pa-IN',
-  urdu: 'ur-IN', ur: 'ur-IN',
 };
-const DEVANAGARI = /[ऀ-ॿ]/;
 
 // languageHint: a BCP-47 tag ("hi-IN") when the user picked a language in
 // Settings, or undefined to let Whisper auto-detect.
@@ -72,12 +63,18 @@ async function transcribeGroq(audioUri: string, languageHint?: string): Promise<
       headers: { Authorization: `Bearer ${env.groqApiKey}` },
       timeout: TIMEOUT_MS,
     });
+    // Whisper often labels spoken Hindi as Urdu (and transcribes it in Urdu
+    // script). With auto-detect, anything that is not Hindi or English is
+    // therefore treated as Hindi: ask again with Hindi forced.
+    if (!languageHint && !LANGUAGE_TO_BCP47[data.language?.toLowerCase() ?? '']) {
+      return transcribeGroq(audioUri, 'hi-IN');
+    }
     // Whisper invents text ("Hello!", "Thank you.") for silence. Drop
     // segments it itself flags as probably-not-speech.
     const text = data.segments
       ? data.segments.filter((s) => !isLikelySilence(s)).map((s) => s.text).join('').trim()
       : data.text.trim();
-    return { text, language: languageHint ?? resolveLanguage(data.language, text) };
+    return { text, language: languageHint ?? LANGUAGE_TO_BCP47[data.language!.toLowerCase()] };
   } catch (e) {
     throw new Error(describeError(e));
   }
@@ -89,13 +86,6 @@ type GroqResponse = { text: string; language?: string; segments?: GroqSegment[] 
 // The same rule Whisper's reference implementation uses to skip silence.
 function isLikelySilence(s: GroqSegment): boolean {
   return s.no_speech_prob > 0.6 && s.avg_logprob < -1;
-}
-
-function resolveLanguage(detected: string | undefined, text: string): string {
-  const mapped = LANGUAGE_TO_BCP47[detected?.toLowerCase() ?? ''];
-  if (mapped) return mapped;
-  // No (or unknown) language from the provider: guess from the script.
-  return DEVANAGARI.test(text) ? 'hi-IN' : 'en-IN';
 }
 
 function describeError(e: unknown): string {

@@ -2,7 +2,7 @@
 
 **Component:** Mobile voice client (`sahayak-mobile/`)
 **Companion docs:** [`banking_voice_agent_architecture.md`](banking_voice_agent_architecture.md) (backend, owned by teammate) · [`mobile_voice_client_plan.md`](mobile_voice_client_plan.md) (original plan for this client)
-**Status:** Phases A–E implemented and tested on a physical iPhone via Expo Go. Phase G (UI/UX polish) implemented; device testing in progress. Phase F (real-backend switch-over) deferred until the backend API is available.
+**Status:** Phases A–E implemented and tested on a physical iPhone via Expo Go. Phase G (UI/UX polish) implemented. **Phase F (real backend) implemented (2026-11-19):** login/register with JWT, secure token storage, route guards, onboarding and profile screens, and the real chat contract against the deployed backend (`https://sahayak-ai-q5ee.onrender.com`). The API layer is verified against the live server; on-device testing of Phase F is pending. Speech-to-text deliberately stays in the app (Groq directly), not the backend's `/transcribe`.
 
 ---
 
@@ -103,24 +103,35 @@ sahayak-mobile/
 ├── .env.local                  Real values incl. API key (git-ignored)
 └── src/
     ├── app/                    Screens (expo-router: every file is a route)
-    │   ├── _layout.tsx         Stack navigator, header, starts connectivity monitor
+    │   ├── _layout.tsx         Stack + route guards (Stack.Protected), restores login, connectivity monitor
+    │   ├── (auth)/             Signed-out screens (group: not part of the URL)
+    │   │   ├── _layout.tsx
+    │   │   ├── login.tsx       /login
+    │   │   └── register.tsx    /register
+    │   ├── onboarding.tsx      First-login profile form (Save or Skip)
     │   ├── index.tsx           Home: chat transcript + mic button
-    │   └── settings.tsx        Language picker, connection status, dev info
+    │   ├── profile.tsx         "My details": view / edit the saved profile
+    │   └── settings.tsx        Account, language picker, connection status, dev info
     ├── components/
+    │   ├── auth-form.tsx       Login / register form (shared)
+    │   ├── profile-form.tsx    Form generated from GET /profile/schema (shared)
     │   ├── mic-button.tsx      Animated 7-state mic button
-    │   ├── message-bubble.tsx  Chat bubble (+ eligibility chips) and typing indicator
+    │   ├── message-bubble.tsx  Chat bubble (+ scheme verdicts, "Needs" chips, sources) and typing indicator
     │   ├── notice-card.tsx     Inline error / warning card with actions
-    │   └── offline-banner.tsx  "You're offline" / "Can't reach server" strip
+    │   └── offline-banner.tsx  Offline / can't reach server / waking up strip
     ├── config/env.ts           The only place that reads environment variables
     ├── constants/colors.ts     Colour palette
     ├── hooks/
     │   └── use-voice-recorder.ts   Mic permission, record/stop, level analysis, playback
     ├── services/
-    │   ├── api.ts              Backend API client: the ONLY file that knows the contract
-    │   ├── api-mock.ts         Mock backend with the same contract
+    │   ├── api.ts              Backend API client: the ONLY file that knows the contract (+ JWT refresh)
+    │   ├── api-mock.ts         Mock backend with the same contract (incl. login/profile)
+    │   ├── token-store.ts      Access/refresh tokens in expo-secure-store (Keychain / Keystore)
     │   ├── stt.ts              Speech-to-text (Groq Whisper + mock)
     │   └── tts.ts              Text-to-speech (voice selection, speak/stop)
+    ├── utils/labels.ts         snake_case ids → readable labels
     └── store/
+        ├── auth.ts             signedOut / signedIn, login/register/logout/restore
         ├── conversation.ts     Messages, session, pipeline state machine, retry
         ├── connectivity.ts     Device online? Backend healthy? (+ monitor hook)
         └── settings.ts         Persisted user preferences (spoken language)
@@ -132,43 +143,41 @@ sahayak-mobile/
 
 ## 5. Backend API Contract (as implemented by the client)
 
-The client is built against this contract, currently served by the built-in mock. **Backend team: please confirm or send changes.** Only `src/services/api.ts` needs to change if it differs.
+The contract is `connect.md` §9, served by `backend/` and deployed on Render. Only `src/services/api.ts` knows it.
 
-### 5.1 Endpoints
+### 5.1 Endpoints used
 
-```
-GET  /api/v1/health
-  → 200 { "status": "ok" }
+All routes except `/auth/*` and `/health` need `Authorization: Bearer <access_token>`. Errors look like `{"error": {"code", "message"}, "detail": message}`.
 
-POST /api/v1/sessions
-  (no body)
-  → 200 { "session_id": "<string>" }
+| Method + path | Request | Response | Used by |
+|---|---|---|---|
+| `GET /health` | – | `{status}` | Offline banner; first call also wakes the free server |
+| `POST /auth/register` | `{login_id, password}` | `{access_token, refresh_token, customer_id, profile_completed}` | Register screen |
+| `POST /auth/login` | same | same | Login screen |
+| `POST /auth/refresh` | `{refresh_token}` | same (refresh token is rotated) | Automatic, on any 401 |
+| `GET /api/v1/profile/schema` | – | `[{field, label, type, options, required}]` | Onboarding + profile form |
+| `GET /api/v1/me/profile` | – | `{fields, profile_completed}` | Profile screen, launch check |
+| `PATCH /api/v1/me/profile` | changed fields only (`null` clears) | `{fields, profile_completed}` | Save; `{}` = Skip |
+| `POST /api/v1/sessions` | – | `{session_id}` | First message of a conversation |
+| `POST /api/v1/sessions/{id}/messages` | `{text, language}` | `{reply_text, display_text, language, results[], facts_updated[], sources[], turn_type, eligible, missing_fields}` | Every voice turn |
 
-POST /api/v1/sessions/{session_id}/messages
-  body:  { "text": "मुझे होम लोन के लिए अप्लाई करना है", "language": "hi-IN" }
-  → 200 {
-      "reply_text": "...",          // required: shown and spoken
-      "language": "hi-IN",          // required: selects the TTS voice
-      "eligible": true,             // optional: shown as an Eligible / Not eligible chip
-      "missing_fields": ["age"],    // optional: shown as "Needs: Age" chips
-      "session_state": "..."        // optional: kept but not displayed
-    }
-```
-
-### 5.2 What the client assumes
+### 5.2 Client behaviour
 
 | Topic | Client behaviour |
 |---|---|
-| **Language tags** | BCP-47 with region, e.g. `hi-IN`, `en-IN` (also `bn-IN`, `mr-IN`, `ta-IN`, `te-IN`, `gu-IN`, `kn-IN`, `ml-IN`, `pa-IN`, `ur-IN`). The reply's `language` picks the voice, so the backend should return the language it actually replied in. |
-| **Sessions** | Created lazily on the first message, then reused for the whole conversation. "Start new conversation" in Settings discards it. |
-| **Timeouts** | 20 s per backend request (Whisper: 30 s). |
-| **Errors** | Any non-2xx is shown as "Server error (status)". If the body is FastAPI-style `{ "detail": "..." }` with a string, that text is appended. |
-| **Health** | `/health` is called on app start, when the app returns to the foreground, after any failed message, and every 30 s while it is failing. It drives the offline banner. |
-| **Field names** | `missing_fields` values are displayed after converting `snake_case` to words ("monthly_income" → "Monthly income"). |
+| **Identity** | `customer_id` comes only from the JWT; the app never sends it. |
+| **Tokens** | Stored in `expo-secure-store`, never AsyncStorage. Access tokens last 30 min. On a 401 the client refreshes **once** (concurrent 401s share one refresh, because the server rotates refresh tokens) and replays the request. If the refresh token itself is rejected, the user is signed out. A network error during refresh does *not* sign the user out. |
+| **Launch** | Saved tokens → straight to the signed-in screens (works offline / while the server sleeps). In the background, `GET /me/profile` re-syncs `profile_completed`. |
+| **Routing** | Signed out → login/register. Signed in + profile not completed → onboarding. Otherwise chat, profile, settings. Enforced by `Stack.Protected` in `_layout.tsx`. |
+| **Sessions** | Server-issued, created lazily on the first message. On a 403 (expired after 24 h, or not this user's), a new session is created and the message re-sent once. Logout and "Start new conversation" discard it. |
+| **Replies** | `display_text` is shown; `reply_text` (shorter, voice-friendly) is spoken. `results[]` → per-scheme ✓/✗ chips (first 3), `results[].ask` → "Needs: …" chips, `sources[]` → "Source: doc (p. n)". |
+| **Timeouts / cold start** | 60 s per request. Render's free tier sleeps after ~15 idle minutes and takes 30–60 s to wake: the banner says "Waking up…" if the first health check is slow, the status line says the server may be waking up after 12 s without a reply, and the login button shows the same hint after 5 s. |
+| **Logout** | Clears tokens, messages and session id, so the next person on the phone sees nothing of the previous chat. A reply that arrives after logout/reset is dropped. |
+| **Errors** | The backend's `error.message` is shown (e.g. "Incorrect phone/email or password"); 5xx and timeouts get friendly generic text. |
 
-### 5.3 Deployment note for the backend
+### 5.3 Language tags
 
-A phone cannot reach `localhost` on a laptop. During development the backend must listen on the LAN (e.g. `uvicorn main:app --host 0.0.0.0 --port 8000`) and the client is pointed at `http://<laptop-LAN-IP>:8000`. CORS is not needed, because this is a native app, not a browser.
+BCP-47 with region (`hi-IN`, `en-IN`, …). The reply's `language` picks the TTS voice.
 
 ---
 
@@ -187,9 +196,16 @@ A phone cannot reach `localhost` on a laptop. During development the backend mus
 - **Errors** are converted to user-readable messages (timeout, no connection, 401 bad key, 429 rate limit, other).
 - A **mock** (`EXPO_PUBLIC_USE_MOCK_STT=true`) returns a fixed sentence after 1 s, so the app runs without a key.
 
-### 6.3 Backend client: `services/api.ts` and `services/api-mock.ts`
-- `api.ts` holds the paths, request/response types, the axios instance (base URL, 20 s timeout) and error translation. It exports `createSession()`, `sendMessage()` and `checkHealth()`.
-- `api-mock.ts` implements the same interface with a 0.8 s delay. It replies in the language it was spoken to. Messages about a loan get a reply asking for income and age with `missing_fields: ["monthly_income", "age"]`; anything else is echoed back. The switch is `EXPO_PUBLIC_USE_MOCK_API`.
+### 6.3 Backend client: `services/api.ts`, `services/api-mock.ts`, `services/token-store.ts`
+- `api.ts` holds the paths, request/response types, the axios instance (base URL, 60 s timeout), the auth interceptors (attach token; refresh-and-retry on 401) and error translation into `ApiError` (readable `message` + HTTP `status`). It exports `register`, `login`, `createSession`, `sendMessage`, `checkHealth`, `getProfile`, `updateProfile`, `getProfileSchema`.
+- `api-mock.ts` implements the same interface with a 0.8 s delay, including login (any id, password ≥ 8; `wrong-password` simulates a 401) and an in-memory profile. Loan questions get a "not eligible yet, needs income and age" reply with `results[]`. The switch is `EXPO_PUBLIC_USE_MOCK_API`.
+- `token-store.ts` keeps the tokens (and non-secret account info: customer id, login id, profile-completed flag) in `expo-secure-store`, which is included in Expo Go.
+
+### 6.3a Auth: `store/auth.ts`, `app/(auth)/*`, `components/auth-form.tsx`
+`status` is `loading` → `signedOut` | `signedIn`. `login`/`register` save the tokens, clear any previous chat and flip the status; the route guard does the navigation. The API client calls back into the store (via `setAuthLostHandler`, avoiding a circular import) when the refresh token is rejected.
+
+### 6.3b Profile: `app/onboarding.tsx`, `app/profile.tsx`, `components/profile-form.tsx`
+The form is generated from `GET /profile/schema`: numbers and text → text inputs, booleans → Yes/No, selects → chips (tap again to clear), multiselects without options → comma-separated text. Only changed fields are sent. Onboarding's "Skip for now" sends `PATCH {}`, which marks the profile completed. The profile screen reloads whenever it comes into view, so facts the chatbot saved ("my income is 25000") show up there.
 
 ### 6.4 Conversation store: `store/conversation.ts`
 Holds the messages, session ID, pipeline status, current error, the pending step for Retry, which message is being spoken, and any TTS notice. All pipeline logic (transcribe → send → speak) lives here rather than in a screen, so it is independent of the UI.
@@ -218,7 +234,7 @@ All configuration lives in `sahayak-mobile/.env.local` (git-ignored). `.env.exam
 | `EXPO_PUBLIC_USE_MOCK_STT` | `true` | `false` = real Groq Whisper |
 | `EXPO_PUBLIC_GROQ_API_KEY` | (empty) | Free key from console.groq.com/keys |
 | `EXPO_PUBLIC_USE_MOCK_API` | `true` | `false` = real backend |
-| `EXPO_PUBLIC_API_BASE_URL` | (empty) | e.g. `http://192.168.1.20:8000`, with no trailing slash |
+| `EXPO_PUBLIC_API_BASE_URL` | (empty) | `https://sahayak-ai-q5ee.onrender.com` (deployed), no trailing slash. Must be HTTPS for release builds. |
 
 Expo copies `EXPO_PUBLIC_*` values into the app bundle at build time, so the dev server must be restarted after changes (`npx expo start --clear`).
 
@@ -265,14 +281,16 @@ All testing so far was done on a **physical iPhone via Expo Go**. Microphone, au
 | TTS | Interrupt by tapping the mic; tap a reply to replay | ✅ |
 | Phase G | Animated mic states, typing indicator, error cards, offline banner, language picker | ⏳ Device test pending |
 
-**Still to test:** an Android device (TTS voice availability and mic behaviour differ between platforms), end-to-end latency measurement, and the full loop against the real backend.
+**Phase F (real backend), automated:** the app's own `api.ts` + `token-store.ts` were bundled for Node (secure-store replaced by an in-memory map) and run against the deployed Render backend: register, duplicate register (409), wrong password (401), login, profile schema, invalid profile value (422), profile PATCH, session + message (reply in ~12 s, `facts_updated: ["monthly_income"]` and the fact visible in `GET /me/profile`), foreign session (403), expired access token → single refresh + replay for two parallel calls, revoked refresh token → signed out. **15/15 passed.** The app also bundles for iOS and Android (`npx expo export`).
+
+**Still to test:** Phase F on a real phone (see the checklist in the app README), an Android device (TTS voice availability and mic behaviour differ between platforms), end-to-end latency measurement, and the full loop against the real backend.
 
 ---
 
 ## 10. Known Limitations and Future Work
 
-1. **Real backend integration (Phase F).** Blocked on the backend API. Expected work: set the two `API` env variables, reconcile any contract differences in `api.ts`, and handle an expired session (e.g. recreate it on a 404 and retry once).
-2. **API key in the app.** Proxy STT through the backend for anything beyond the demo.
+1. **Password reset** does not exist (backend has no SMS/email provider), so a forgotten password means a new account.
+2. **API key in the app.** STT intentionally still calls Groq from the phone (team decision). For anything beyond the demo, switch `services/stt.ts` to the backend's existing `POST /api/v1/transcribe` and remove `EXPO_PUBLIC_GROQ_API_KEY`.
 3. **Silence detection thresholds** are device-dependent and are being tuned from real measurements.
 4. **TTS voice availability** depends on the phone. Some Android phones need the Google TTS Hindi voice data installed. The app detects a missing voice and tells the user.
 5. **Offline STT.** The architecture calls for an offline voice path (§2, principle 5). On-device recognition (`expo-speech-recognition` or `whisper.rn`) needs a custom development build rather than Expo Go and is left as a stretch goal. TTS is already fully on-device.

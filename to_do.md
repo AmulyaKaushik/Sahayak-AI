@@ -155,15 +155,16 @@ Set these in the host's dashboard — **never commit them**. `backend/.env` is g
 
 Detailed steps: `connect.md` sections 3.4 and 8, and architecture doc section 13 (R3).
 
-- [ ] **[code]** Add `expo-secure-store`; token store; auth store (`signedOut` / `signedIn`).
-- [ ] **[code]** Login and register screens; route guard with `Stack.Protected`; on launch restore the saved session.
-- [ ] **[code]** Onboarding + profile screens built from `GET /api/v1/profile/schema`, saving with `PATCH /api/v1/me/profile` (Skip must still work).
-- [ ] **[code]** `src/services/api.ts`: real paths and types; `Authorization` header; on 401 refresh **once at a time** and retry; on 403 create a new session; 60 s timeout; ping `/health` when the app opens.
+- [x] **[code]** Add `expo-secure-store`; token store; auth store (`signedOut` / `signedIn`).
+- [x] **[code]** Login and register screens; route guard with `Stack.Protected`; on launch restore the saved session.
+- [x] **[code]** Onboarding + profile screens built from `GET /api/v1/profile/schema`, saving with `PATCH /api/v1/me/profile` (Skip must still work).
+- [x] **[code]** `src/services/api.ts`: real paths and types; `Authorization` header; on 401 refresh **once at a time** and retry; on 403 create a new session; 60 s timeout; ping `/health` when the app opens.
 - [ ] **[code]** `src/services/stt.ts`: call `POST /api/v1/transcribe` and **remove `EXPO_PUBLIC_GROQ_API_KEY` from the app** (anything `EXPO_PUBLIC_*` is readable by anyone who has the app).
-- [ ] **[code]** Show `display_text` on screen, speak `reply_text`, show sources; "waking up the assistant…" message for cold starts.
-- [ ] **[code]** Clear messages and session on logout (otherwise user B sees user A's chat on a shared phone).
-- [ ] **[code]** Keep the mock API working for demos (`EXPO_PUBLIC_USE_MOCK_API=true`).
-- [ ] **[you]** Set `EXPO_PUBLIC_USE_MOCK_API=false`, `EXPO_PUBLIC_USE_MOCK_STT=false` and `EXPO_PUBLIC_API_BASE_URL=https://<your-host>` in `.env.local` (no trailing slash).
+  *Decision 2026-11-19: STT stays in the app (Groq called directly) for now; the backend route exists if this changes.*
+- [x] **[code]** Show `display_text` on screen, speak `reply_text`, show sources; "waking up the assistant…" message for cold starts.
+- [x] **[code]** Clear messages and session on logout (otherwise user B sees user A's chat on a shared phone).
+- [x] **[code]** Keep the mock API working for demos (`EXPO_PUBLIC_USE_MOCK_API=true`).
+- [x] **[you]** Set `EXPO_PUBLIC_USE_MOCK_API=false`, `EXPO_PUBLIC_USE_MOCK_STT=false` and `EXPO_PUBLIC_API_BASE_URL=https://<your-host>` in `.env.local` (no trailing slash).
 - [ ] **[you]** The URL must be **HTTPS** — iOS and Android release builds block plain `http://`.
 - [ ] **[you]** Build a real app (not Expo Go) for testing: `npx eas-cli@latest build --profile preview --platform android`.
 - [ ] **[you]** `app.json`: app name, unique `android.package` / `ios.bundleIdentifier`, icon, version, and the **microphone permission text**.

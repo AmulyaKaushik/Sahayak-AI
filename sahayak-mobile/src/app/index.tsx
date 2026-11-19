@@ -1,6 +1,6 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useRef } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, type ScrollViewInstance, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { MessageBubble, TypingIndicator } from '@/components/message-bubble';
@@ -17,7 +17,11 @@ function formatDuration(ms: number) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-const EXAMPLES = ['"I want to apply for a home loan"', '"मुझे बचत खाता खोलना है"'];
+const EXAMPLES = [
+  '"Am I eligible for a home loan?"',
+  '"Which government schemes can I get?"',
+  '"क्या मुझे किसान क्रेडिट कार्ड मिल सकता है?"',
+];
 
 // Home screen (route "/"): the voice conversation.
 export default function HomeScreen() {
@@ -25,12 +29,16 @@ export default function HomeScreen() {
   const messages = useConversation((s) => s.messages);
   const status = useConversation((s) => s.status);
   const error = useConversation((s) => s.error);
+  const slow = useConversation((s) => s.slow);
   const canRetry = useConversation((s) => s.pending !== null);
   const speakingId = useConversation((s) => s.speakingId);
   const ttsNotice = useConversation((s) => s.ttsNotice);
   const { processRecording, retry, clearError, speakMessage, stopSpeaking, dismissTtsNotice } =
     useConversation.getState();
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<ScrollViewInstance>(null);
+  // Vertical position of each message bubble, so a long reply can be scrolled
+  // to the question that prompted it (instead of showing only its tail).
+  const bubbleY = useRef<Record<string, number>>({});
   const insets = useSafeAreaInsets();
 
   const micState: MicState = voice.isRecording
@@ -57,7 +65,9 @@ export default function HomeScreen() {
     recording: `Listening… ${formatDuration(voice.durationMillis)} · tap to stop`,
     transcribing: 'Understanding what you said…',
     sending: 'Sending…',
-    waiting: 'Sahayak is thinking…',
+    waiting: slow
+      ? 'Still working… the server may be waking up (up to a minute)'
+      : 'Sahayak is thinking…',
     speaking: 'Speaking… tap the mic to interrupt',
     error: 'Tap the mic to try again',
   };
@@ -77,8 +87,21 @@ export default function HomeScreen() {
         ref={scrollRef}
         style={styles.messages}
         contentContainerStyle={styles.messagesContent}
-        // Keep the newest message in view.
-        onContentSizeChange={() => scrollRef.current?.scrollToEnd({ animated: true })}>
+        // Keep the newest message in view. A reply can be taller than the
+        // screen: then show it from the user's question onwards, so the
+        // question stays visible and the reply is read from its start.
+        onContentSizeChange={() => {
+          const last = messages[messages.length - 1];
+          const asked = messages[messages.length - 2];
+          if (last?.role === 'assistant' && asked?.role === 'user') {
+            const y = bubbleY.current[asked.id];
+            if (y !== undefined) {
+              scrollRef.current?.scrollTo({ y: Math.max(0, y - 8), animated: true });
+              return;
+            }
+          }
+          scrollRef.current?.scrollToEnd({ animated: true });
+        }}>
         {messages.length === 0 && (
           <View style={styles.empty}>
             <Ionicons name="chatbubbles-outline" size={48} color={colors.textFaint} />
@@ -94,16 +117,24 @@ export default function HomeScreen() {
           </View>
         )}
         {messages.map((m) => (
-          <MessageBubble
+          <View
             key={m.id}
-            message={m}
-            isSpeaking={m.id === speakingId}
-            onPress={
-              m.role === 'assistant' && !busy && !voice.isRecording
-                ? () => speakMessage(m.id)
-                : undefined
-            }
-          />
+            onLayout={(e) => {
+              bubbleY.current[m.id] = e.nativeEvent.layout.y;
+            }}
+            // The bubble itself aligns left/right; this wrapper must not
+            // squeeze it, so let it fill the row.
+            style={styles.row}>
+            <MessageBubble
+              message={m}
+              isSpeaking={m.id === speakingId}
+              onPress={
+                m.role === 'assistant' && !busy && !voice.isRecording
+                  ? () => speakMessage(m.id)
+                  : undefined
+              }
+            />
+          </View>
         ))}
         {(status === 'sending' || status === 'waiting') && <TypingIndicator />}
       </ScrollView>
@@ -173,6 +204,7 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   messages: { flex: 1 },
+  row: { alignSelf: 'stretch' },
   messagesContent: { padding: 16, gap: 10, flexGrow: 1 },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, padding: 24 },
   emptyTitle: { fontSize: 20, fontWeight: '700', color: colors.text, marginTop: 8 },

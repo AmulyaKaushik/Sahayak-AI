@@ -4,17 +4,16 @@ import { Animated, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { colors } from '@/constants/colors';
 import type { ChatMessage } from '@/store/conversation';
+import { humanize, schemeName } from '@/utils/labels';
 
 function formatTime(timestamp: number) {
   const d = new Date(timestamp);
   return `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-// Turns backend field names like "monthly_income" into "Monthly income".
-function humanize(field: string) {
-  const s = field.replace(/_/g, ' ');
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
+// A "which schemes am I eligible for" answer can evaluate every scheme; show
+// only the first few verdict chips so the bubble stays readable.
+const MAX_SCHEME_CHIPS = 3;
 
 export function MessageBubble({
   message,
@@ -27,7 +26,15 @@ export function MessageBubble({
   onPress?: () => void;
 }) {
   const isUser = message.role === 'user';
-  const { eligible, missing_fields } = message.meta ?? {};
+  const results = message.meta?.results ?? [];
+  const sources = message.meta?.sources ?? [];
+  const shown = results.slice(0, MAX_SCHEME_CHIPS);
+  const hidden = results.length - shown.length;
+  // Profile fields the backend still needs, across all evaluated schemes.
+  const needs = [...new Set(results.flatMap((r) => r.ask ?? []))];
+  const sourceText = [
+    ...new Set(sources.map((s) => (s.page != null ? `${s.doc} (p. ${s.page})` : s.doc))),
+  ].join(', ');
 
   return (
     <Pressable
@@ -42,19 +49,26 @@ export function MessageBubble({
       ]}>
       <Text style={[styles.text, isUser && styles.userText]}>{message.text}</Text>
 
-      {(eligible !== undefined || !!missing_fields?.length) && (
+      {(shown.length > 0 || needs.length > 0) && (
         <View style={styles.chips}>
-          {eligible !== undefined && (
-            <Text style={[styles.chip, eligible ? styles.chipYes : styles.chipNo]}>
-              {eligible ? 'Eligible' : 'Not eligible'}
+          {shown.map((r) => (
+            <Text key={r.scheme_id} style={[styles.chip, r.eligible ? styles.chipYes : styles.chipNo]}>
+              {r.eligible ? '✓' : '✗'} {schemeName(r.scheme_id)}
             </Text>
-          )}
-          {missing_fields?.map((f) => (
+          ))}
+          {hidden > 0 && <Text style={[styles.chip, styles.chipMore]}>+{hidden} more</Text>}
+          {needs.map((f) => (
             <Text key={f} style={[styles.chip, styles.chipNeed]}>
               Needs: {humanize(f)}
             </Text>
           ))}
         </View>
+      )}
+
+      {sourceText.length > 0 && (
+        <Text style={styles.sources} numberOfLines={2}>
+          Source: {sourceText}
+        </Text>
       )}
 
       <View style={styles.footer}>
@@ -139,6 +153,8 @@ const styles = StyleSheet.create({
   chipYes: { color: colors.success, backgroundColor: colors.successSoft },
   chipNo: { color: colors.danger, backgroundColor: colors.dangerSoft },
   chipNeed: { color: colors.warning, backgroundColor: colors.warningSoft },
+  chipMore: { color: colors.textMuted, backgroundColor: colors.border },
+  sources: { fontSize: 12, color: colors.textMuted, marginTop: 6, fontStyle: 'italic' },
   footer: { flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 4 },
   meta: { fontSize: 11, color: colors.textMuted },
   userMeta: { color: colors.primarySoft },

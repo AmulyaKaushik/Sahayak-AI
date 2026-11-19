@@ -1,7 +1,9 @@
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Link } from 'expo-router';
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { colors } from '@/constants/colors';
 import { env } from '@/config/env';
+import { useAuth } from '@/store/auth';
 import { useConnectivity } from '@/store/connectivity';
 import { useConversation } from '@/store/conversation';
 import { LANGUAGE_OPTIONS, useSettings } from '@/store/settings';
@@ -17,12 +19,32 @@ export default function SettingsScreen() {
   const backendOk = useConnectivity((s) => s.backendOk);
   const checking = useConnectivity((s) => s.checking);
   const checkBackend = useConnectivity((s) => s.checkBackend);
+  const loginId = useAuth((s) => s.loginId);
+  const logout = useAuth((s) => s.logout);
+
+  function confirmLogout() {
+    Alert.alert('Sign out?', 'This conversation will be cleared from this phone.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Sign out', style: 'destructive', onPress: logout },
+    ]);
+  }
 
   const backendStatus =
     backendOk === null ? 'Not checked yet' : backendOk ? 'Reachable' : 'Unreachable';
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <Text style={styles.heading}>Account</Text>
+      <Row label="Signed in as" value={loginId ?? '—'} />
+      <Link href="/profile" asChild>
+        <Pressable style={styles.button}>
+          <Text style={styles.buttonText}>My details</Text>
+        </Pressable>
+      </Link>
+      <Pressable onPress={confirmLogout} style={[styles.button, styles.dangerButton]}>
+        <Text style={[styles.buttonText, styles.dangerText]}>Sign out</Text>
+      </Pressable>
+
       <Text style={styles.heading}>I will speak in</Text>
       <View style={styles.segmented} accessibilityRole="radiogroup">
         {LANGUAGE_OPTIONS.map((o) => {
@@ -131,4 +153,6 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   buttonText: { color: colors.primary, fontSize: 16, fontWeight: '600' },
+  dangerButton: { borderColor: colors.danger },
+  dangerText: { color: colors.danger },
 });
