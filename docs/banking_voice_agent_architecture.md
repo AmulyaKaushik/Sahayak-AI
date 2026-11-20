@@ -24,7 +24,7 @@ Multilingual, voice-first assistant that tells customers which bank loans and go
 | Terminal chat (`python main.py`) | **Done** |
 | Backend test suite | **126 passing** (about 12–25 s; some tests call live Groq) |
 | Cloud deployment (demo) | **Deployed on Render** (Docker) with Supabase Postgres + Upstash Redis; register, login, chat, RAG, Hindi, profile and security checks verified over HTTPS. Replies take 6–11 s there (section 11) |
-| Mobile app ↔ backend connection | **Not done** — app still runs on its built-in mock |
+| Mobile app ↔ backend connection | **Done (2026-11-19)** — login/register, onboarding + profile screens, real chat contract; verified against the deployed backend and on an iPhone (Expo Go, SDK 58) |
 | On-device offline mode, rule proposals from documents, PII-safe logging, connection pooling | **Not built** |
 
 **Verdict:** the backend is functionally complete for the core flow, is deployed for a demo, and works end to end against the real Groq and Gemini services. The one big missing piece is the **mobile app connection**: the app still needs login screens, token handling and the new response contract (section 13, R3). The remaining High issues are H1 (non-English verdict check) and H3 (Groq free-tier limits).
@@ -334,7 +334,7 @@ What produced it: removed the worker round-trip whose output was discarded; merg
 |---|---|---|
 | H1 | **Non-English replies skip the verdict check.** The refiner verifies the eligible/not-eligible phrase only for English; for Hindi etc. only numbers are checked | A translation could flip "not eligible". Fix: translate **templated** sentences per language instead of using the LLM, or check the verdict in each language |
 | H3 | **Groq free-tier throttling** (8,000 tokens/min/model) | Latency spikes under load. Fix: dev-tier key; retries with backoff; per-user rate limits |
-| H7 | **Mobile app not connected** to the (now deployed) backend | See section 13, R3 |
+| H7 | ~~Mobile app not connected~~ — **fixed 2026-11-19**; app connected (speech-to-text still calls Groq directly from the app by choice) | — |
 | H8 | **Slow replies on the cloud (6–11 s)**: a new database connection per call | Add a connection pool; check that Render and Supabase are in the same region |
 
 ### Open — Medium
